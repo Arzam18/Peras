@@ -13,6 +13,10 @@ use std::thread::JoinHandle;
 
 const DEFAULT_HASH_MB: usize = 64;
 const MAX_THREADS: usize = 256;
+/// Range spanned by `UCI_Elo`. The top is the engine's own measured strength, so the
+/// option stays meaningful across its whole range.
+const UCI_ELO_MIN: i32 = 1320;
+const UCI_ELO_MAX: i32 = 2800;
 
 struct Options {
     hash_mb: usize,
@@ -59,7 +63,7 @@ impl Engine {
                 analyse_mode: false,
                 skill_level: 20,
                 limit_strength: false,
-                elo: 1320,
+                elo: UCI_ELO_MIN,
                 variant: Variant::Standard,
             },
             tt,
@@ -88,7 +92,7 @@ impl Engine {
     /// Effective skill level from either the explicit level or a UCI_Elo target.
     fn effective_skill(&self) -> i32 {
         if self.options.limit_strength {
-            let e = (self.options.elo - 1320) as f64 / (3190 - 1320) as f64;
+            let e = (self.options.elo - UCI_ELO_MIN) as f64 / (UCI_ELO_MAX - UCI_ELO_MIN) as f64;
             let lvl = ((37.2473 * e - 40.8525) * e + 22.2943) * e - 0.311438;
             lvl.clamp(0.0, 19.0).round() as i32
         } else {
@@ -208,7 +212,7 @@ impl Engine {
             }
             "uci_elo" => {
                 if let Ok(e) = value.parse::<i32>() {
-                    self.options.elo = e.clamp(1320, 3190);
+                    self.options.elo = e.clamp(UCI_ELO_MIN, UCI_ELO_MAX);
                     self.apply_searcher_options();
                 }
             }
@@ -431,7 +435,7 @@ pub fn run(args: Vec<String>) {
                 println!("option name Ponder type check default false");
                 println!("option name Skill Level type spin default 20 min 0 max 20");
                 println!("option name UCI_LimitStrength type check default false");
-                println!("option name UCI_Elo type spin default 1320 min 1320 max 3190");
+                println!("option name UCI_Elo type spin default {} min {} max {}", UCI_ELO_MIN, UCI_ELO_MIN, UCI_ELO_MAX);
                 let vars: Vec<String> = Variant::ALL.iter().map(|v| format!("var {}", v.name())).collect();
                 println!("option name UCI_Variant type combo default standard {}", vars.join(" "));
                 println!("uciok");

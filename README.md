@@ -32,6 +32,10 @@ go wtime 60000 btime 60000 winc 1000 binc 1000
 - **Performance**: Lazy SMP up to 256 threads and time management that adapts to search stability.
 - **Play control**: `Skill Level` and `UCI_Elo` for weaker opponents, pondering, and `searchmoves` for restricted analysis.
 
+## Strength
+
+About 2800 Elo on one thread at 10s+0.1s, measured against Stockfish's rating-limited modes.
+
 ## Variants
 
 Chess960 is always available. The rest are an optional build feature, so the default binary contains no variant code:
@@ -73,7 +77,7 @@ cutechess-cli -variant crazyhouse -each proto=uci tc=10+0.1 \
 | `Ponder`            | false      | Allow `go ponder` and `ponderhit`              |
 | `Skill Level`       | 20         | Lower to weaken play                           |
 | `UCI_LimitStrength` | false      | Enables `UCI_Elo`                              |
-| `UCI_Elo`           | 1320       | Target rating, 1320 to 3190                    |
+| `UCI_Elo`           | 1320       | Target rating, 1320 to 2800                    |
 
 The console also takes `d` to print the board, `eval` for a static score, `perft N` and `divide N` for move counts, and `bench [depth]` for a fixed-depth benchmark. `peras bench` and `peras perft N [fen]` work as command-line arguments too.
 
