@@ -1,14 +1,41 @@
 [package]
-name = "hydrochess"
-version = "0.1.0"
-edition = "2021"
+name = "peras"
+version = "1.0.0"
+edition = "2024"
+authors = ["FirePlank"]
+description = "Peras - a UCI chess engine for 8x8 chess, specialised from the Apeiron infinite-chess engine. Chess variants behind the `variants` feature."
+license = "GPL-3.0-only"
+repository = "https://github.com/FirePlank/HydroChess"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "peras"
+path = "src/lib.rs"
 
-[dev-dependencies]
-criterion = "0.3"
+[[bin]]
+name = "peras"
+path = "src/main.rs"
+
+[features]
+default = []
+# Chess variants (crazyhouse, antichess, three-check, racing kings, king of the hill).
+# Without it every variant branch, table and state field is compiled out, so the
+# standard binary is byte-for-byte the engine it would be with no variant code at all.
+variants = []
 
 [dependencies]
-lazy_static = "1.4.0"
-rand = "0.8.5"
-rand_chacha = "0.3.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.test]
+opt-level = 3
+debug-assertions = true
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

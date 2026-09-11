@@ -1,4 +1,9 @@
 /target
-/benches
+/baseline
+*.pgn
 
+# Editor and tooling artifacts
 .idea
+.vscode
+.specify/
+.windsurf/

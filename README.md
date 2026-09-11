@@ -1,24 +1,97 @@
-# HydroChess
+# Peras
 
-HydroChess is a chess engine written in Rust that is capable of beating most intermediate to advanced players.
+A strong UCI chess engine in Rust, for standard chess, Chess960 and five other variants.
 
-For variant support I have made a modified version of HydroChess called [Fairy-HydroChess](https://github.com/FirePlank/Fairy-HydroChess). It supports a lot of variants so I suggest you check it out if you are interested!
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](LICENSE)
 
-## Installation
+Peras is a port of [Apeiron](https://github.com/FirePlank/infinite-chess-engine), the infinite chess engine, onto bitboards and specialised for the 64-square board. It has no dependencies and builds into a single binary.
 
-To install HydroChess, you will need to have Rust and Cargo installed on your machine. You can find instructions for installing Rust [here](https://www.rust-lang.org/tools/install).
+## Quick Start
 
-Once you have Rust and Cargo installed, you can install HydroChess by cloning this repository and running the following command in the root directory:
+```bash
+cargo build --release
+./target/release/peras
+```
 
-`cargo build --release`
+That binary speaks [UCI](https://www.chessprogramming.org/UCI), so point any chess GUI at it (Cute Chess, Arena, Banksia) or run it from the terminal:
 
-This will compile the HydroChess code and create an executable in the `target/release` directory.
+```
+uci
+setoption name Hash value 256
+setoption name Threads value 4
+position startpos moves e2e4 c7c5
+go wtime 60000 btime 60000 winc 1000 binc 1000
+```
 
-## Running HydroChess
+## Features
 
-To run HydroChess, you will need to use a chess interface that is compatible with the [Universal Chess Interface (UCI)](https://en.wikipedia.org/wiki/Universal_Chess_Interface) protocol.
+- **Search**: iterative deepening PVS with aspiration windows and MultiPV, a shared lock-free transposition table, and the full modern pruning set (razoring, reverse futility, null move, ProbCut, late move pruning and reductions, SEE and history pruning, singular and check extensions).
+- **Move ordering**: staged move picking driven by butterfly, capture, continuation, pawn, low-ply and countermove histories, with correction history on the static evaluation.
+- **Evaluation**: tapered piece-square tables, mobility, pawn structure, king safety, rook files, outposts and bishop pair, plus endgame knowledge for insufficient material, mop-up and drawish scaling.
+- **Board**: magic bitboards, incremental Zobrist keys, static exchange evaluation, and full Chess960 support.
+- **Performance**: Lazy SMP up to 256 threads and time management that adapts to search stability.
+- **Play control**: `Skill Level` and `UCI_Elo` for weaker opponents, pondering, and `searchmoves` for restricted analysis.
 
-Once you have a UCI-compatible chess interface installed, you can start a game by selecting HydroChess as the engine. The specific steps for doing this will depend on the interface you are using.
+## Variants
 
-## Contributing
-I made this project as more of a hobby and more for myself as a challenge, but feel free to suggest any changes or improvements if you so please.
+Chess960 is always available. The rest are an optional build feature, so the default binary contains no variant code:
+
+```bash
+cargo build --release --features variants
+```
+
+| `UCI_Variant`   | Rules                                                                                      |
+|-----------------|---------------------------------------------------------------------------------------------|
+| `standard`      | Orthodox chess                                                                              |
+| `chess960`      | Fischer random, with Shredder and X-FEN castling                                            |
+| `crazyhouse`    | Captured pieces join your pocket and can be dropped (`P@e4`)                                |
+| `antichess`     | Captures are compulsory, the king is an ordinary piece, and losing everything wins          |
+| `3check`        | The third check wins                                                                        |
+| `racingkings`   | No pawns, no checks allowed, first king to the eighth rank wins                             |
+| `kingofthehill` | Reach d4, d5, e4 or e5 with your king to win                                                |
+
+Most GUIs set `UCI_Variant` for you, and the usual aliases (`fischerandom`, `giveaway`, `koth`, `zh`) are accepted.
+
+```bash
+cutechess-cli -variant crazyhouse -each proto=uci tc=10+0.1 \
+  -engine cmd=peras -engine cmd=peras option.Threads=2 -rounds 50
+```
+
+## UCI Options
+
+| Option              | Default    | Description                                    |
+|---------------------|------------|------------------------------------------------|
+| `Hash`              | 64         | Transposition table size in MB                 |
+| `Clear Hash`        |            | Empties the transposition table                |
+| `Threads`           | 1          | Search threads                                 |
+| `Move Overhead`     | 10         | Milliseconds reserved per move for latency     |
+| `MultiPV`           | 1          | Principal variations to report                 |
+| `Contempt`          | 15         | Draw aversion in centipawns                    |
+| `UCI_Chess960`      | false      | Chess960 castling rules and notation           |
+| `UCI_Variant`       | `standard` | Variant to play                                |
+| `UCI_AnalyseMode`   | false      | Neutral analysis, without contempt             |
+| `Ponder`            | false      | Allow `go ponder` and `ponderhit`              |
+| `Skill Level`       | 20         | Lower to weaken play                           |
+| `UCI_LimitStrength` | false      | Enables `UCI_Elo`                              |
+| `UCI_Elo`           | 1320       | Target rating, 1320 to 3190                    |
+
+The console also takes `d` to print the board, `eval` for a static score, `perft N` and `divide N` for move counts, and `bench [depth]` for a fixed-depth benchmark. `peras bench` and `peras perft N [fen]` work as command-line arguments too.
+
+## Testing
+
+```bash
+cargo test --release                     # perft, evaluation and transposition table
+cargo test --release --features variants # the above plus every variant
+```
+
+Perft counts are checked against independent references, Chess960 and the variants included.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
+
+## Links
+
+- [Apeiron](https://github.com/FirePlank/infinite-chess-engine) - The infinite chess engine Peras is ported from
+- [Stockfish](https://github.com/official-stockfish/Stockfish) - The world's strongest open-source chess engine
+- [Chess Programming Wiki](https://www.chessprogramming.org/) - Engine development resources
