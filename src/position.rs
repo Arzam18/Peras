@@ -3,6 +3,7 @@
 //! check detection, static exchange evaluation and repetition detection.
 
 use crate::bitboard::*;
+use crate::nnue::NnueState;
 use crate::types::*;
 use crate::zobrist::{ZOBRIST, cuckoo, h1, h2, psq_key};
 
@@ -123,6 +124,7 @@ pub struct Position {
     castling_rook_square: [Square; 16],
     castling_path: [Bitboard; 16],
     states: Vec<StateInfo>,
+    nnue: NnueState,
 }
 
 pub const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -150,6 +152,7 @@ impl Position {
             castling_rook_square: [SQ_NONE; 16],
             castling_path: [0; 16],
             states,
+            nnue: NnueState::new(),
         }
     }
 
@@ -309,6 +312,7 @@ impl Position {
         pos.set_checks_given(variant, checks_given);
 
         pos.set_state();
+        pos.nnue.reset();
         Ok(pos)
     }
 
@@ -1149,6 +1153,7 @@ impl Position {
         self.by_type[pc.piece_type().idx()] |= sq_bb(sq);
         self.by_color[pc.color().idx()] |= sq_bb(sq);
         self.piece_count[pc.idx()] += 1;
+        self.nnue.record(pc, SQ_NONE, sq);
     }
 
     #[inline(always)]
@@ -1158,6 +1163,7 @@ impl Position {
         self.by_color[pc.color().idx()] ^= sq_bb(sq);
         self.board[sq as usize] = Piece::NONE;
         self.piece_count[pc.idx()] -= 1;
+        self.nnue.record(pc, sq, SQ_NONE);
     }
 
     #[inline(always)]
@@ -1168,11 +1174,13 @@ impl Position {
         self.by_color[pc.color().idx()] ^= ft;
         self.board[from as usize] = Piece::NONE;
         self.board[to as usize] = pc;
+        self.nnue.record(pc, from, to);
     }
 
     /// Makes `m`, which must be legal. `gives_check` is the precomputed check flag.
     pub fn make_move(&mut self, m: Move, gives_check: bool) {
         debug_assert!(m.is_ok());
+        self.nnue.begin();
         let prev = *self.state();
         let mut st = StateInfo {
             castling_rights: prev.castling_rights,
@@ -1320,6 +1328,7 @@ impl Position {
             }
         }
         self.states.push(st);
+        self.nnue.push();
         self.set_check_info();
     }
 
@@ -1367,6 +1376,7 @@ impl Position {
         if m.is_drop() {
             self.remove_piece(m.to_sq());
             self.states.pop();
+            self.nnue.pop();
             self.game_ply -= 1;
             return;
         }
@@ -1393,6 +1403,7 @@ impl Position {
         }
 
         self.states.pop();
+        self.nnue.pop();
         self.game_ply -= 1;
     }
 
@@ -1436,12 +1447,27 @@ impl Position {
         st.checkers = 0;
         self.side_to_move = self.side_to_move.flip();
         self.states.push(st);
+        self.nnue.begin();
+        self.nnue.push();
         self.set_check_info();
     }
 
     pub fn unmake_null_move(&mut self) {
         self.states.pop();
+        self.nnue.pop();
         self.side_to_move = self.side_to_move.flip();
+    }
+
+    /// Network evaluation from the side to move's point of view.
+    #[inline]
+    pub fn nnue_evaluate(&mut self) -> Value {
+        let kings = [self.king_square(Color::White), self.king_square(Color::Black)];
+        let mut pieces = [0 as Bitboard; 12];
+        for (i, bb) in pieces.iter_mut().enumerate() {
+            *bb = self.by_color[i / 6] & self.by_type[i % 6];
+        }
+        let count = popcount(self.pieces());
+        self.nnue.evaluate(self.side_to_move, kings, &pieces, count)
     }
 
     /// Hash key of the position after `m`, for prefetching the child's TT bucket.

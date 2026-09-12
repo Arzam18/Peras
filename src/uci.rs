@@ -16,7 +16,7 @@ const MAX_THREADS: usize = 256;
 /// Range spanned by `UCI_Elo`. The top is the engine's own measured strength, so the
 /// option stays meaningful across its whole range.
 const UCI_ELO_MIN: i32 = 1320;
-const UCI_ELO_MAX: i32 = 2800;
+const UCI_ELO_MAX: i32 = 3400;
 
 struct Options {
     hash_mb: usize,
@@ -466,7 +466,7 @@ pub fn run(args: Vec<String>) {
             }
             "eval" => {
                 engine.join_worker();
-                let v = crate::eval::evaluate(&engine.pos);
+                let v = crate::eval::evaluate(&mut engine.pos);
                 println!("info string static eval (side to move): {} ({})", v, format_score(v));
             }
             "perft" => {

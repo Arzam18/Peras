@@ -1,13 +1,15 @@
-//! Static evaluation entry point: insufficient-material draws, the hand-crafted
-//! evaluation, endgame mop-up guidance, drawish-ending scaling and fifty-move damping.
+//! Static evaluation entry point: insufficient-material draws, the network (or, for the
+//! variants it was not trained for, the hand-crafted evaluation), endgame mop-up guidance
+//! and fifty-move damping.
 
+#[cfg(feature = "variants")]
 pub mod hce;
 pub mod mopup;
 #[cfg(feature = "variants")]
 pub mod variants;
 
 use crate::bitboard::*;
-use crate::position::{Position, piece_value};
+use crate::position::Position;
 use crate::types::*;
 
 /// Largest slice of the evaluation the halfmove-clock damping may remove while a
@@ -17,7 +19,7 @@ const RULE50_DAMP_CAP: Value = 700;
 
 /// Evaluation from the side to move's perspective, clamped below the mate range.
 #[inline]
-pub fn evaluate(pos: &Position) -> Value {
+pub fn evaluate(pos: &mut Position) -> Value {
     #[cfg(feature = "variants")]
     match pos.variant() {
         Variant::Antichess => return variants::antichess(pos).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX),
@@ -39,12 +41,9 @@ pub fn evaluate(pos: &Position) -> Value {
     if pos.is_insufficient_material() {
         return VALUE_DRAW;
     }
-    let raw = hce::evaluate(pos);
+    let raw = pos.nnue_evaluate();
     let (mop, mop_active) = mopup::mop_up_term(pos);
-    let mut v = raw + mop;
-    v = apply_pawnless_scale(pos, v);
-    v = apply_drawish_scale(pos, v);
-    v = apply_rule50_damping(pos, v, mop_active);
+    let v = apply_rule50_damping(pos, raw + mop, mop_active);
     v.clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX)
 }
 
@@ -69,53 +68,6 @@ pub fn side_cannot_mate(pos: &Position, c: Color) -> bool {
     false
 }
 
-/// A pawnless leader whose force can never mate can't win however large the
-/// material lead; the insufficient-material rule only fires once the board is
-/// nearly empty, so without this the eval claims full material up to the draw.
-fn apply_pawnless_scale(pos: &Position, v: Value) -> Value {
-    if v == 0 {
-        return v;
-    }
-    let leader = if v > 0 { pos.side_to_move() } else { pos.side_to_move().flip() };
-    if pos.pieces_cp(leader, PieceType::Pawn) != 0 {
-        return v;
-    }
-    // King plus at most four pieces: bigger forces always have mating material.
-    if popcount(pos.pieces_c(leader)) > 5 {
-        return v;
-    }
-    if side_cannot_mate(pos, leader) { v / 8 } else { v }
-}
-
-/// Rook/minor endings that are drawn with correct defence (R+minor vs R, R vs minor)
-/// are pulled hard toward the draw when the stronger side has no pawns.
-fn apply_drawish_scale(pos: &Position, v: Value) -> Value {
-    if v == 0 || pos.count_all() > 6 {
-        return v;
-    }
-    if pos.pieces_p(PieceType::Queen) != 0 {
-        return v;
-    }
-    let npm_w = pos.non_pawn_material(Color::White);
-    let npm_b = pos.non_pawn_material(Color::Black);
-    let (strong, strong_npm, weak_npm) = if npm_w > npm_b {
-        (Color::White, npm_w, npm_b)
-    } else if npm_b > npm_w {
-        (Color::Black, npm_b, npm_w)
-    } else {
-        return v;
-    };
-    if pos.pieces_cp(strong, PieceType::Pawn) != 0 {
-        return v;
-    }
-    // Only the stronger side's own claim is scaled (eval is side-to-move relative).
-    let strong_to_move = pos.side_to_move() == strong;
-    if (v > 0) != strong_to_move {
-        return v;
-    }
-    if strong_npm - weak_npm <= piece_value(PieceType::Bishop) { v / 8 } else { v }
-}
-
 #[inline]
 fn apply_rule50_damping(pos: &Position, v: Value, mop_active: bool) -> Value {
     let clock = pos.rule50_count().min(199);
@@ -133,8 +85,8 @@ mod tests {
     #[test]
     fn startpos_is_balanced() {
         crate::init();
-        let pos = Position::startpos();
-        assert_eq!(evaluate(&pos), 0);
+        let mut pos = Position::startpos();
+        assert!(evaluate(&mut pos).abs() < 100);
     }
 
     #[test]
@@ -146,9 +98,9 @@ mod tests {
             "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
         ];
         for fen in fens {
-            let pos = Position::from_fen(fen).unwrap();
-            let flipped = Position::from_fen(&flip_fen(fen)).unwrap();
-            assert_eq!(evaluate(&pos), evaluate(&flipped), "asymmetric eval for {}", fen);
+            let mut pos = Position::from_fen(fen).unwrap();
+            let mut flipped = Position::from_fen(&flip_fen(fen)).unwrap();
+            assert_eq!(evaluate(&mut pos), evaluate(&mut flipped), "asymmetric eval for {}", fen);
         }
     }
 
@@ -181,17 +133,17 @@ mod tests {
     #[test]
     fn material_advantage_shows() {
         crate::init();
-        let pos = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1").unwrap();
-        assert!(evaluate(&pos) > 800);
-        let pos = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 b - - 0 1").unwrap();
-        assert!(evaluate(&pos) < -800);
+        let mut pos = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1").unwrap();
+        assert!(evaluate(&mut pos) > 500);
+        let mut pos = Position::from_fen("4k3/8/8/8/3Q4/8/8/4K3 b - - 0 1").unwrap();
+        assert!(evaluate(&mut pos) < -500);
     }
 
     #[test]
     fn insufficient_material_is_draw() {
         crate::init();
         for fen in ["4k3/8/8/8/8/8/8/4K3 w - - 0 1", "4k3/8/8/8/8/8/8/4KB2 w - - 0 1", "4k3/8/8/8/8/8/8/4KN2 b - - 0 1", "4k3/8/8/8/8/8/2b5/4KB2 w - - 0 1"] {
-            assert_eq!(evaluate(&Position::from_fen(fen).unwrap()), 0, "{}", fen);
+            assert_eq!(evaluate(&mut Position::from_fen(fen).unwrap()), 0, "{}", fen);
         }
     }
 }

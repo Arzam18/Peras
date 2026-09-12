@@ -4,7 +4,7 @@ A strong UCI chess engine in Rust, for standard chess, Chess960 and five other v
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](LICENSE)
 
-Peras is a port of [Apeiron](https://github.com/FirePlank/infinite-chess-engine), the infinite chess engine, onto bitboards and specialised for the 64-square board. It has no dependencies and builds into a single binary.
+Peras takes its search from [Apeiron](https://github.com/FirePlank/infinite-chess-engine), the infinite chess engine, and rebuilds it on bitboards for the 64-square board, with its own network evaluation. It has no dependencies and builds into a single binary.
 
 ## Quick Start
 
@@ -13,7 +13,7 @@ cargo build --release
 ./target/release/peras
 ```
 
-That binary speaks [UCI](https://www.chessprogramming.org/UCI), so point any chess GUI at it (Cute Chess, Arena, Banksia) or run it from the terminal:
+The network in `nets/peras.nnue` is compiled into the binary; set `EVALFILE=/path/to/net` to build with another one. That binary speaks [UCI](https://www.chessprogramming.org/UCI), so point any chess GUI at it (Cute Chess, Arena, Banksia) or run it from the terminal:
 
 ```
 uci
@@ -27,18 +27,18 @@ go wtime 60000 btime 60000 winc 1000 binc 1000
 
 - **Search**: iterative deepening PVS with aspiration windows and MultiPV, a shared lock-free transposition table, and the full modern pruning set (razoring, reverse futility, null move, ProbCut, late move pruning and reductions, SEE and history pruning, singular and check extensions).
 - **Move ordering**: staged move picking driven by butterfly, capture, continuation, pawn, low-ply and countermove histories, with correction history on the static evaluation.
-- **Evaluation**: tapered piece-square tables, mobility, pawn structure, king safety, rook files, outposts and bishop pair, plus endgame knowledge for insufficient material, mop-up and drawish scaling.
+- **Evaluation**: NNUE, a `(768x10hm -> 1024)x2 -> 8` network with SCReLU activation trained on Leela Chess Zero self-play data, with lazily updated accumulators, king-bucket refresh caching and AVX2 inference; plus insufficient-material and mop-up knowledge.
 - **Board**: magic bitboards, incremental Zobrist keys, static exchange evaluation, and full Chess960 support.
 - **Performance**: Lazy SMP up to 256 threads and time management that adapts to search stability.
 - **Play control**: `Skill Level` and `UCI_Elo` for weaker opponents, pondering, and `searchmoves` for restricted analysis.
 
 ## Strength
 
-About 2800 Elo on one thread at 10s+0.1s, measured against Stockfish's rating-limited modes.
+About 3400 Elo on one thread at 10s+0.1s, measured against Stockfish's rating-limited modes. It scores 75% against the top of that ladder and 19% against full-strength Stockfish on the same hardware and time control.
 
 ## Variants
 
-Chess960 is always available. The rest are an optional build feature, so the default binary contains no variant code:
+Chess960 is always available. The rest are an optional build feature, so the default binary contains no variant code. Crazyhouse, three-check and king of the hill keep the hand-crafted evaluation, since the network was not trained on them:
 
 ```bash
 cargo build --release --features variants
@@ -77,7 +77,7 @@ cutechess-cli -variant crazyhouse -each proto=uci tc=10+0.1 \
 | `Ponder`            | false      | Allow `go ponder` and `ponderhit`              |
 | `Skill Level`       | 20         | Lower to weaken play                           |
 | `UCI_LimitStrength` | false      | Enables `UCI_Elo`                              |
-| `UCI_Elo`           | 1320       | Target rating, 1320 to 2800                    |
+| `UCI_Elo`           | 1320       | Target rating, 1320 to 3400                    |
 
 The console also takes `d` to print the board, `eval` for a static score, `perft N` and `divide N` for move counts, and `bench [depth]` for a fixed-depth benchmark. `peras bench` and `peras perft N [fen]` work as command-line arguments too.
 
@@ -96,6 +96,6 @@ GPL-3.0. See [LICENSE](LICENSE).
 
 ## Links
 
-- [Apeiron](https://github.com/FirePlank/infinite-chess-engine) - The infinite chess engine Peras is ported from
+- [Apeiron](https://github.com/FirePlank/infinite-chess-engine) - The infinite chess engine whose search Peras is adapted from
 - [Stockfish](https://github.com/official-stockfish/Stockfish) - The world's strongest open-source chess engine
 - [Chess Programming Wiki](https://www.chessprogramming.org/) - Engine development resources

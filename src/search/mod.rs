@@ -626,7 +626,8 @@ impl Searcher {
         // A forced move under a clock needs no deliberation.
         if self.root_moves.len() == 1 && self.thread_id == 0 && self.tm.timed && !self.limits.infinite && self.limits.depth == 0 {
             let m = self.root_moves[0].mv;
-            let score = self.adjusted_eval(pos, evaluate(pos), 0);
+            let raw = evaluate(pos);
+            let score = self.adjusted_eval(pos, raw, 0);
             self.root_moves[0].score = score;
             self.prev_score = score;
             self.completed_depth = 1;
@@ -869,7 +870,12 @@ impl Searcher {
         let key = pos.key();
         let tt_move = self.tt.probe(key).map_or(Move::NONE, |d| d.mv);
         let in_check = pos.in_check();
-        self.stack[0].static_eval = if in_check { 0 } else { self.adjusted_eval(pos, evaluate(pos), 0) };
+        self.stack[0].static_eval = if in_check {
+            0
+        } else {
+            let raw = evaluate(pos);
+            self.adjusted_eval(pos, raw, 0)
+        };
         self.order_root_moves(pos, tt_move);
 
         let mut best_score = -VALUE_INFINITE;
@@ -1025,7 +1031,8 @@ impl Searcher {
 
         if ply >= MAX_PLY - 1 {
             let idx = self.prev_move_idx(ply);
-            return self.adjusted_eval(pos, evaluate(pos), idx);
+            let raw = evaluate(pos);
+            return self.adjusted_eval(pos, raw, idx);
         }
 
         // A reversible move that repeats a position is always available as a draw.

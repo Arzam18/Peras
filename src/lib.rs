@@ -1,11 +1,13 @@
-//! Peras: a UCI chess engine for standard 8x8 chess. The search is a port of the
-//! Apeiron infinite-chess engine's, specialised onto bitboards. Building with the
-//! `variants` feature adds crazyhouse, antichess, three-check, racing kings and
-//! king of the hill; without it none of that code exists.
+//! Peras: a UCI chess engine for standard 8x8 chess. The search is adapted from the
+//! Apeiron infinite-chess engine's and rebuilt on bitboards; the evaluation is its own
+//! network, trained separately. Building with the `variants` feature adds crazyhouse,
+//! antichess, three-check, racing kings and king of the hill, which keep the
+//! hand-crafted evaluation; without it none of that code exists.
 
 pub mod bitboard;
 pub mod eval;
 pub mod movegen;
+pub mod nnue;
 pub mod position;
 pub mod search;
 pub mod types;

@@ -1,9 +1,10 @@
 [package]
 name = "peras"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
+build = "build.rs"
 authors = ["FirePlank"]
-description = "Peras - a UCI chess engine for 8x8 chess, specialised from the Apeiron infinite-chess engine. Chess variants behind the `variants` feature."
+description = "Peras - a UCI chess engine for 8x8 chess, with an NNUE evaluation and a search adapted from the Apeiron infinite-chess engine. Chess variants behind the `variants` feature."
 license = "GPL-3.0-only"
 repository = "https://github.com/FirePlank/HydroChess"
 
