@@ -17,7 +17,7 @@ Version bumps are decided by what changed rather than by an accumulator:
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
 ## v2.0.0 (2026-09-12)
-Commit: `PENDING` • [compare to v1.0.0](https://github.com/FirePlank/HydroChess/compare/8c4ef55...PENDING)
+Commit: `187848a` • [compare to v1.0.0](https://github.com/FirePlank/Peras/compare/8c4ef55...187848a)
 
 **It is about 580 Elo better than v1.0.0.** Against Stockfish's rating-limited modes it measures about 3400 on one thread at 10s+0.1s, where v1.0.0 measured about 2800. A direct 200-game match finished 196-2-2, which is too lopsided for the rating formula to resolve, so the ladder figure is the one quoted here.
 
@@ -40,7 +40,7 @@ Commit: `PENDING` • [compare to v1.0.0](https://github.com/FirePlank/HydroChes
 - Pawnless-leader and drawish-ending scaling, which existed to correct the hand-crafted evaluation's habit of claiming a full material lead in positions no force can win, and which the network does not need
 
 ## v1.0.0 (2026-09-12)
-Commit: `8c4ef55` • [compare to the last HydroChess commit](https://github.com/FirePlank/HydroChess/compare/6b12040...8c4ef55)
+Commit: `8c4ef55` • [compare to the last HydroChess commit](https://github.com/FirePlank/Peras/compare/6b12040...8c4ef55)
 
 **The first numbered release, and the point at which HydroChess became Peras.**
 
