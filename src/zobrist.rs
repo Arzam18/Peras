@@ -31,7 +31,7 @@ pub struct ZobristKeys {
 }
 
 pub static ZOBRIST: ZobristKeys = {
-    let mut seed = 0x1070372u64;
+    let mut seed = 0x5045_5241_53u64;
     let mut psq = [[0u64; 64]; PIECE_NB];
     let mut p = 0;
     while p < PIECE_NB {

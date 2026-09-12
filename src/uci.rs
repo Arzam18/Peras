@@ -42,8 +42,6 @@ struct Engine {
     searchers: Option<Vec<Box<Searcher>>>,
     #[allow(clippy::vec_box)]
     worker: Option<JoinHandle<(Vec<Box<Searcher>>, SearchOutcome)>>,
-    /// Per-game time scaling constant; negative until first computed.
-    original_time_adjust: f64,
 }
 
 impl Engine {
@@ -71,7 +69,6 @@ impl Engine {
             ponderhit,
             searchers: None,
             worker: None,
-            original_time_adjust: -1.0,
         };
         e.rebuild_searchers();
         e
@@ -133,7 +130,6 @@ impl Engine {
                 sr.clear();
             }
         }
-        self.original_time_adjust = -1.0;
         self.pos = Position::from_fen_variant(self.options.variant.start_fen(), self.options.variant).expect("variant start position");
         self.pos.set_chess960(self.options.chess960);
     }
@@ -310,7 +306,7 @@ impl Engine {
         }
         self.ponderhit.store(false, Ordering::Relaxed);
 
-        let tm = TimeManager::init(&limits, self.pos.side_to_move(), self.pos.game_ply(), self.options.move_overhead, &mut self.original_time_adjust);
+        let tm = TimeManager::init(&limits, self.pos.side_to_move(), self.pos.game_ply(), self.options.move_overhead);
         let pos = self.pos.clone();
         let mut searchers = self.searchers.take().expect("searchers available");
         let stop = Arc::clone(&self.stop);

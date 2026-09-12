@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Versioning policy
 
-`v1.0.0` is a deliberate baseline reset that coincides with the HydroChess → Peras rename. Everything before it was unreleased and unnumbered, so no earlier entries exist.
+`v1.0.0` is a deliberate baseline reset that coincides with the HydroChess → Peras rename. Nothing before it was ever released or numbered; `v0.1.0` is recorded after the fact, as the last HydroChess state, so the timeline has a starting point to measure against.
 
 Version bumps are decided by what changed rather than by an accumulator:
 
@@ -16,8 +16,29 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v2.0.1 (2026-09-12)
+[compare to v2.0.0](https://github.com/FirePlank/Peras/compare/v2.0.0...v2.0.1)
+
+**Elo-neutral, and not a regression.** The time manager was rebuilt on this engine's own measurements rather than inherited constants.
+
+```
+Score of new vs old: 184 - 161 - 342  [0.517] 687
+Elo: +11.8 +/- 18.4   (95%: -6.5 to +30.2), 0 time losses
+Clock used per game: new 15.17s, old 15.23s
+Mean search depth:   new 18.89,  old 18.88
+SPRT bounds elo0=-5 elo1=0, alpha=beta=0.05, 10s+0.1s, one thread
+```
+
+### Changed
+- The time manager plans against a horizon measured from 660 of this engine's own games instead of a fixed guess. Expected remaining moves is not monotonic: it falls to a minimum near ply 115 and then rises, because the games still running that late are the long drawish ones. No decaying formula expresses that shape, so the measured curve is tabulated and interpolated
+- The allocator is now a budget divided by that horizon with a single urgency scale, replacing the previous logarithm-of-clock polynomial and the per-game adjustment constant it threaded through the UCI layer
+- The Zobrist seed is the engine's own
+
+### Fixed
+- The horizon taken straight from the statistics under-spent the clock by 19% and cost nearly a full ply of depth, worth about 45 Elo. Time never spent is wasted and games often end before the horizon, so the urgency scale is calibrated against measured clock usage rather than read off the distribution
+
 ## v2.0.0 (2026-09-12)
-Commit: `187848a` • [compare to v1.0.0](https://github.com/FirePlank/Peras/compare/8c4ef55...187848a)
+[compare to v1.0.0](https://github.com/FirePlank/Peras/compare/v1.0.0...v2.0.0)
 
 **It is about 580 Elo better than v1.0.0.** Against Stockfish's rating-limited modes it measures about 3400 on one thread at 10s+0.1s, where v1.0.0 measured about 2800. A direct 200-game match finished 196-2-2, which is too lopsided for the rating formula to resolve, so the ladder figure is the one quoted here.
 
@@ -40,9 +61,9 @@ Commit: `187848a` • [compare to v1.0.0](https://github.com/FirePlank/Peras/com
 - Pawnless-leader and drawish-ending scaling, which existed to correct the hand-crafted evaluation's habit of claiming a full material lead in positions no force can win, and which the network does not need
 
 ## v1.0.0 (2026-09-12)
-Commit: `8c4ef55` • [compare to the last HydroChess commit](https://github.com/FirePlank/Peras/compare/6b12040...8c4ef55)
+[compare to v0.1.0](https://github.com/FirePlank/Peras/compare/v0.1.0...v1.0.0)
 
-**The first numbered release, and the point at which HydroChess became Peras.**
+**It is about 700 Elo better than v0.1.0.** Against Stockfish's rating-limited modes it measures about 2800 on one thread at 10s+0.1s, where v0.1.0 measures about 2100. This is also the point at which HydroChess became Peras.
 
 ### Added
 - Lazy SMP up to 256 threads, with `Threads` wired through UCI and time management that adapts to search stability
@@ -61,3 +82,16 @@ Commit: `8c4ef55` • [compare to the last HydroChess commit](https://github.com
 ### Fixed
 - Crazyhouse drops could overflow the fixed move buffers, since a position with a full pocket exceeds 256 legal moves; the buffer is now 512 with the `variants` feature and 256 without
 - Three-check FEN parsing accepts both the lichess form giving checks remaining and the appended form giving checks delivered
+
+## v0.1.0 (2024-11-07)
+[the last HydroChess commit](https://github.com/FirePlank/Peras/commit/6b12040)
+
+**The last version under the HydroChess name, recorded here as the baseline the rest is measured against.** It plays at about 2100 on one thread at 10s+0.1s, measured against Stockfish's rating-limited modes. That figure is softer than the later ones: Stockfish's rating limiting is poorly calibrated this low, and its 1800 and 2000 rungs imply 2030 while its 2200 rung implies 2200.
+
+### Added
+- Magic bitboards, a transposition table, static exchange evaluation and move ordering
+- A hand-crafted evaluation
+- UCI, with perft and a board display
+
+### Removed
+- Variant support, which moved to a separate Fairy-HydroChess fork; it returns in v1.0.0 behind a build feature

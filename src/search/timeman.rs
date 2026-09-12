@@ -50,9 +50,8 @@ impl TimeManager {
         }
     }
 
-    /// `original_time_adjust` persists across the game (reset to a negative value on a
-    /// new game) so the per-game scaling stays consistent.
-    pub fn init(limits: &Limits, us: Color, ply: i32, move_overhead: u64, original_time_adjust: &mut f64) -> TimeManager {
+    /// Allocates this move's budget from the clock and the measured horizon.
+    pub fn init(limits: &Limits, us: Color, ply: i32, move_overhead: u64) -> TimeManager {
         let start = Instant::now();
 
         if limits.infinite {
@@ -77,33 +76,22 @@ impl TimeManager {
         let time_f = time as f64;
         let overhead = move_overhead as f64;
 
-        let scaled_time = time_f.max(1.0);
-        let mut mtg: f64 = if limits.movestogo > 0 { limits.movestogo.min(50) as f64 } else { 50.0 };
-        // Below one second gradually reduce the horizon.
-        if scaled_time < 1000.0 && limits.movestogo == 0 {
-            mtg = (scaled_time * 0.05).max(1.0);
-        }
-
-        let time_left = (time_f + inc * (mtg - 1.0) - overhead * (2.0 + mtg)).max(1.0);
-
-        let (opt_scale, max_scale);
-        if limits.movestogo == 0 {
-            if *original_time_adjust < 0.0 {
-                *original_time_adjust = 0.3272 * time_left.log10() - 0.4141;
-            }
-            let log_time_sec = (scaled_time / 1000.0).log10();
-            let opt_constant = (0.0029869 + 0.00033554 * log_time_sec).min(0.004905);
-            let max_constant = (3.3744 + 3.0608 * log_time_sec).max(3.1441);
-            opt_scale = (0.012112 + (ply as f64 + 3.22713).powf(0.46866) * opt_constant).min(0.19404 * time_f / time_left)
-                * *original_time_adjust;
-            max_scale = (max_constant + ply as f64 / 12.352).min(6.873);
+        // Horizon: how many moves this engine actually has left, not a fixed guess.
+        let mr = if limits.movestogo > 0 {
+            (limits.movestogo as f64).min(moves_remaining(ply))
         } else {
-            opt_scale = ((0.88 + ply as f64 / 116.4) / mtg).min(0.88 * time_f / time_left);
-            max_scale = 1.3 + 0.11 * mtg;
-        }
+            moves_remaining(ply)
+        };
 
-        let optimum = (opt_scale * time_left).max(1.0);
-        let maximum = optimum.max((0.8097 * time_f - overhead).min(max_scale * optimum));
+        // Clock we can commit: what is on it, plus the increments we will earn over the
+        // remaining moves, less the latency reserved for each of them.
+        let budget = (time_f + inc * (mr - 1.0) - overhead * (mr + 1.0)).max(1.0);
+
+        // An even share of that budget, nudged by URGENCY, and never more than a fixed
+        // slice of the clock in one move.
+        let optimum = (budget / mr * URGENCY).max(1.0).min(time_f * 0.35);
+        // The hard ceiling allows one move to run long when the search is unsettled.
+        let maximum = optimum.max((time_f * 0.8 - overhead).min(optimum * BURST));
 
         let mut optimum = optimum as u64;
         let mut maximum = maximum.max(1.0) as u64;
@@ -125,4 +113,31 @@ impl TimeManager {
     pub fn elapsed_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
+}
+
+/// Expected remaining moves at ply 0, 16, 32 ... 240, measured over 660 of this engine's
+/// own games (median 128 plies). The curve falls to a minimum near ply 115 and then rises,
+/// because the games still running that late are the long drawish ones; no decaying
+/// formula expresses that, so the measured curve is tabulated and interpolated.
+const MOVES_REMAINING: [f64; 16] = [
+    71.6, 63.6, 55.7, 48.0,
+    41.6, 35.9, 31.4, 29.4,
+    29.8, 35.5, 39.9, 46.2,
+    51.1, 53.4, 52.6, 48.8,
+];
+
+/// Scales the even share. Above 1.0 spends earlier, below 1.0 holds time back.
+const URGENCY: f64 = 1.65;
+/// How far one move may exceed its share before the hard ceiling stops it.
+const BURST: f64 = 4.0;
+
+/// Expected remaining moves at `ply`, interpolating the measured table.
+fn moves_remaining(ply: i32) -> f64 {
+    let x = (ply.max(0) as f64) / 16.0;
+    let i = x.floor() as usize;
+    if i + 1 >= MOVES_REMAINING.len() {
+        return MOVES_REMAINING[MOVES_REMAINING.len() - 1];
+    }
+    let f = x - i as f64;
+    MOVES_REMAINING[i] * (1.0 - f) + MOVES_REMAINING[i + 1] * f
 }
