@@ -16,6 +16,22 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v2.1.0 (2026-09-12)
+[compare to v2.0.1](https://github.com/FirePlank/Peras/compare/v2.0.1...v2.1.0)
+
+**No change to full-strength play.** `UCI_Elo` now maps onto strengths this engine was measured at, instead of a curve fitted to a different engine.
+
+### Fixed
+- `UCI_Elo` advertised a floor of 1320, which the engine cannot reach. Its weakest setting plays at about 2300, so every request below that silently returned a far stronger opponent. The advertised range is now the range it actually spans
+- Requests between roughly 3010 and 3030 all collapsed onto nearly the same opponent, since `Skill Level` 12 to 16 spans only 20 Elo
+
+### Changed
+- The rating-to-level mapping is a table of each level's measured strength, replacing an inherited cubic. Spacing comes from 598 games between the levels themselves; absolute placement from a further 360 games matching levels 0, 4, 8 and 16 against opponents of known rating, each chosen so the score landed near even
+
+### Known issues
+- The table is good to roughly +/- 100 Elo, since the reference opponents are Stockfish's rating-limited modes and that scale is itself only approximately calibrated. Its rungs disagreed by 170 Elo when measuring v0.1.0, and by 134 when measuring `Skill Level` 4
+- There is a 275-Elo step between levels 19 and 20, in the weakening itself, which discards up to a pawn at random through level 19 and is then switched off at 20. Smoothing it changes what every level plays at, so it needs its own measurement pass
+
 ## v2.0.1 (2026-09-12)
 [compare to v2.0.0](https://github.com/FirePlank/Peras/compare/v2.0.0...v2.0.1)
 

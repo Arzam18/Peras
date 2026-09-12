@@ -13,10 +13,27 @@ use std::thread::JoinHandle;
 
 const DEFAULT_HASH_MB: usize = 64;
 const MAX_THREADS: usize = 256;
-/// Range spanned by `UCI_Elo`. The top is the engine's own measured strength, so the
-/// option stays meaningful across its whole range.
-const UCI_ELO_MIN: i32 = 1320;
-const UCI_ELO_MAX: i32 = 3400;
+/// Strength of each `Skill Level`. Spacing comes from 598 games played between the levels
+/// themselves; the absolute placement comes from a further 360 games in which levels 0, 4,
+/// 8 and 16 were matched directly against opponents of known rating, chosen so each score
+/// landed near even. Levels never played directly are interpolated between their neighbours.
+///
+/// Roughly +/- 100 Elo: the reference opponents are Stockfish's rating-limited modes, whose
+/// own scale is only approximately calibrated.
+///
+/// The curve is not smooth, so no formula reproduces it. Levels 12 to 16 span 20 Elo while
+/// 19 to 20 spans 275, because the weakening discards up to a pawn at random right through
+/// level 19 and is then switched off entirely at 20.
+#[rustfmt::skip]
+const SKILL_ELO: [i32; 21] = [
+    2301, 2364, 2428, 2491, 2555, 2624, 2692,
+    2760, 2828, 2874, 2919, 2964, 3010, 3015,
+    3020, 3025, 3030, 3065, 3099, 3125, 3400,
+];
+
+/// Range spanned by `UCI_Elo`: the weakest and strongest the engine actually plays.
+const UCI_ELO_MIN: i32 = SKILL_ELO[0];
+const UCI_ELO_MAX: i32 = SKILL_ELO[20];
 
 struct Options {
     hash_mb: usize,
@@ -89,9 +106,14 @@ impl Engine {
     /// Effective skill level from either the explicit level or a UCI_Elo target.
     fn effective_skill(&self) -> i32 {
         if self.options.limit_strength {
-            let e = (self.options.elo - UCI_ELO_MIN) as f64 / (UCI_ELO_MAX - UCI_ELO_MIN) as f64;
-            let lvl = ((37.2473 * e - 40.8525) * e + 22.2943) * e - 0.311438;
-            lvl.clamp(0.0, 19.0).round() as i32
+            // The level whose measured strength is nearest the target. The table rises,
+            // so this is the first level sitting above the midpoint with its successor.
+            let target = self.options.elo;
+            let mut lvl = 0;
+            while lvl < 20 && target > (SKILL_ELO[lvl] + SKILL_ELO[lvl + 1]) / 2 {
+                lvl += 1;
+            }
+            lvl as i32
         } else {
             self.options.skill_level
         }

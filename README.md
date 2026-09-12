@@ -77,7 +77,7 @@ cutechess-cli -variant crazyhouse -each proto=uci tc=10+0.1 \
 | `Ponder`            | false      | Allow `go ponder` and `ponderhit`              |
 | `Skill Level`       | 20         | Lower to weaken play                           |
 | `UCI_LimitStrength` | false      | Enables `UCI_Elo`                              |
-| `UCI_Elo`           | 1320       | Target rating, 1320 to 3400                    |
+| `UCI_Elo`           | 2301       | Target rating, 2301 to 3400                    |
 
 The console also takes `d` to print the board, `eval` for a static score, `perft N` and `divide N` for move counts, and `bench [depth]` for a fixed-depth benchmark. `peras bench` and `peras perft N [fen]` work as command-line arguments too.
 
