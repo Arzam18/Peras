@@ -9,11 +9,12 @@ Peras takes its search from [Apeiron](https://github.com/FirePlank/infinite-ches
 ## Quick Start
 
 ```bash
+curl -sL https://github.com/FirePlank/Peras-networks/releases/download/peras-v3/peras-v3.nnue -o nets/peras.nnue
 cargo build --release
 ./target/release/peras
 ```
 
-The network in `nets/peras.nnue` is compiled into the binary; set `EVALFILE=/path/to/net` to build with another one. That binary speaks [UCI](https://www.chessprogramming.org/UCI), so point any chess GUI at it (Cute Chess, Arena, Banksia) or run it from the terminal:
+The network is not kept in this repository, since each one is tens of megabytes. It lives in [Peras-networks](https://github.com/FirePlank/Peras-networks/releases), which holds every network the engine has shipped so any tagged commit can still be built. The build compiles it into the binary from `nets/peras.nnue`; set `EVALFILE=/path/to/net` to use another one. That binary speaks [UCI](https://www.chessprogramming.org/UCI), so point any chess GUI at it (Cute Chess, Arena, Banksia) or run it from the terminal:
 
 ```
 uci

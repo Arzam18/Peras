@@ -3,6 +3,9 @@
 /baseline
 *.pgn
 
+# Networks live in the Peras-networks repository, not here
+nets/*.nnue
+
 # Agent worktrees and scratch state
 .claude/
 
