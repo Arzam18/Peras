@@ -312,7 +312,8 @@ impl Position {
         pos.set_checks_given(variant, checks_given);
 
         pos.set_state();
-        pos.nnue.reset();
+        let snap = pos.nnue_snapshot();
+        pos.nnue.reset(snap);
         Ok(pos)
     }
 
@@ -1153,28 +1154,107 @@ impl Position {
         self.by_type[pc.piece_type().idx()] |= sq_bb(sq);
         self.by_color[pc.color().idx()] |= sq_bb(sq);
         self.piece_count[pc.idx()] += 1;
-        self.nnue.record(pc, SQ_NONE, sq);
+        if self.nnue.recording {
+            self.record_threats(pc, true, sq, !0);
+        }
     }
 
     #[inline(always)]
     fn remove_piece(&mut self, sq: Square) {
         let pc = self.board[sq as usize];
+        if self.nnue.recording {
+            self.record_threats(pc, false, sq, !0);
+        }
         self.by_type[pc.piece_type().idx()] ^= sq_bb(sq);
         self.by_color[pc.color().idx()] ^= sq_bb(sq);
         self.board[sq as usize] = Piece::NONE;
         self.piece_count[pc.idx()] -= 1;
-        self.nnue.record(pc, sq, SQ_NONE);
     }
 
     #[inline(always)]
     fn move_piece(&mut self, from: Square, to: Square) {
         let pc = self.board[from as usize];
         let ft = sq_bb(from) | sq_bb(to);
+        if self.nnue.recording {
+            self.record_threats(pc, false, from, ft);
+        }
         self.by_type[pc.piece_type().idx()] ^= ft;
         self.by_color[pc.color().idx()] ^= ft;
         self.board[from as usize] = Piece::NONE;
         self.board[to as usize] = pc;
-        self.nnue.record(pc, from, to);
+        if self.nnue.recording {
+            self.record_threats(pc, true, to, ft);
+        }
+    }
+
+    /// Records the threats that `pc` appearing on (`put`) or leaving `s` creates and
+    /// destroys: its own attacks, attacks on it, and the lines it opens or closes for
+    /// sliders behind it. Called with the board still holding the piece when it leaves.
+    /// Sliders whose line contains every square of `no_rays` skip the discovered part,
+    /// which a piece moving along that line would only undo again; pass all ones to
+    /// never skip.
+    fn record_threats(&mut self, pc: Piece, put: bool, s: Square, no_rays: Bitboard) {
+        let occ = self.pieces();
+        let b_att = bishop_attacks(s, occ);
+        let r_att = rook_attacks(s, occ);
+        let slider_att = b_att | r_att;
+        let occ_nok = occ & !self.by_type[PieceType::King.idx()];
+        let queens = self.by_type[PieceType::Queen.idx()];
+        let sliders = ((self.by_type[PieceType::Bishop.idx()] | queens) & b_att)
+            | ((self.by_type[PieceType::Rook.idx()] | queens) & r_att);
+        let pt = pc.piece_type();
+
+        let mut b = sliders;
+        while b != 0 {
+            let ssq = pop_lsb(&mut b);
+            let slider = self.board[ssq as usize];
+            let ray = crate::nnue::ray_pass(ssq, s);
+            let discovered = ray & slider_att & occ_nok;
+            if discovered != 0 && (ray & no_rays) != no_rays {
+                let tsq = lsb(discovered);
+                let tpc = self.board[tsq as usize];
+                if crate::nnue::can_slider_threat(tpc, slider) {
+                    self.nnue.dirty.push(!put, slider, tpc, ssq, tsq);
+                }
+            }
+            if pt != PieceType::King && crate::nnue::can_slider_threat(pc, slider) {
+                self.nnue.dirty.push(put, slider, pc, ssq, s);
+            }
+        }
+        if pt == PieceType::King {
+            return;
+        }
+
+        let pawns = self.by_type[PieceType::Pawn.idx()];
+        let knights = self.by_type[PieceType::Knight.idx()];
+        let targets = match pt {
+            PieceType::Pawn => knights | self.by_type[PieceType::Rook.idx()],
+            PieceType::Bishop | PieceType::Rook => {
+                pawns | knights | self.by_type[PieceType::Bishop.idx()] | self.by_type[PieceType::Rook.idx()]
+            }
+            _ => occ_nok,
+        };
+        let mut threatened = match pt {
+            PieceType::Pawn => pawn_attacks(pc.color(), s),
+            PieceType::Knight => knight_attacks(s),
+            PieceType::Bishop => b_att,
+            PieceType::Rook => r_att,
+            _ => slider_att,
+        } & targets;
+        while threatened != 0 {
+            let t = pop_lsb(&mut threatened);
+            self.nnue.dirty.push(put, pc, self.board[t as usize], s, t);
+        }
+
+        let mut incoming = knight_attacks(s) & knights;
+        if matches!(pt, PieceType::Knight | PieceType::Rook) {
+            incoming |= (pawn_attacks(Color::White, s) & pawns & self.by_color[Color::Black.idx()])
+                | (pawn_attacks(Color::Black, s) & pawns & self.by_color[Color::White.idx()]);
+        }
+        while incoming != 0 {
+            let src = pop_lsb(&mut incoming);
+            self.nnue.dirty.push(put, self.board[src as usize], pc, src, s);
+        }
     }
 
     /// Makes `m`, which must be legal. `gives_check` is the precomputed check flag.
@@ -1328,7 +1408,8 @@ impl Position {
             }
         }
         self.states.push(st);
-        self.nnue.push();
+        let snap = self.nnue_snapshot();
+        self.nnue.push(snap);
         self.set_check_info();
     }
 
@@ -1447,8 +1528,7 @@ impl Position {
         st.checkers = 0;
         self.side_to_move = self.side_to_move.flip();
         self.states.push(st);
-        self.nnue.begin();
-        self.nnue.push();
+        self.nnue.push_same();
         self.set_check_info();
     }
 
@@ -1461,13 +1541,21 @@ impl Position {
     /// Network evaluation from the side to move's point of view.
     #[inline]
     pub fn nnue_evaluate(&mut self) -> Value {
-        let kings = [self.king_square(Color::White), self.king_square(Color::Black)];
-        let mut pieces = [0 as Bitboard; 12];
-        for (i, bb) in pieces.iter_mut().enumerate() {
-            *bb = self.by_color[i / 6] & self.by_type[i % 6];
-        }
         let count = popcount(self.pieces());
-        self.nnue.evaluate(self.side_to_move, kings, &pieces, count)
+        self.nnue.evaluate(self.side_to_move, count)
+    }
+
+    /// Test access to the network state.
+    #[cfg(test)]
+    pub fn nnue_mut(&mut self) -> &mut NnueState {
+        &mut self.nnue
+    }
+
+    /// What the network sees of the current board.
+    #[inline]
+    pub fn nnue_snapshot(&self) -> crate::nnue::Snapshot {
+        let kings = [self.king_square(Color::White), self.king_square(Color::Black)];
+        crate::nnue::Snapshot::build(&self.board, &self.by_type, &self.by_color, kings)
     }
 
     /// Hash key of the position after `m`, for prefetching the child's TT bucket.

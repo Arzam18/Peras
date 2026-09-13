@@ -1,6 +1,10 @@
 /target
+/target-*
 /baseline
 *.pgn
+
+# Agent worktrees and scratch state
+.claude/
 
 # Editor and tooling artifacts
 .idea

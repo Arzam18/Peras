@@ -1,23 +1,100 @@
 //! NNUE evaluation.
 //!
-//! Architecture: `(768 x 10 king buckets, horizontally mirrored -> 1024)x2 -> 8 output buckets`
-//! with SCReLU activation, trained with bullet. Weights are `i16` quantised by 255 (feature
-//! transformer) and 64 (output layer) and embedded in the binary.
+//! Architecture, per perspective: `768 x 10 king buckets` piece-square inputs, `59808`
+//! threat inputs (which piece attacks which, from where) and `4560` pawn-pair inputs, all
+//! horizontally mirrored onto the king's half of the board, feeding a `1024`-wide
+//! accumulator; `(72048 -> 1024)x2 -> 8 output buckets` with SCReLU activation, trained with
+//! bullet. Piece-square weights are `i16` and the threat and pawn-pair weights `i8`, both
+//! quantised by 255; the output layer is `i16` quantised by 64. The net is embedded in the
+//! binary. The threat and pawn-pair feature sets are the ones Stockfish 19 introduced.
 //!
-//! Each perspective keeps an accumulator per ply. `make_move` only records which pieces
-//! changed; the accumulators are brought up to date on the first evaluation that needs
-//! them by replaying those changes from the nearest computed ply. When the king crosses
-//! into another bucket (or over the mirror line) the accumulator is instead rebuilt from a
-//! cache holding the last accumulator seen in that bucket, updating only the pieces that
-//! differ from the cached board.
+//! While a move is made, the board primitives record every threat it creates or destroys
+//! (a piece's own attacks, attacks on it, and the lines it opens or closes for sliders
+//! behind it), the scheme Stockfish uses. Each ply also keeps a snapshot of the board and
+//! pawns. The accumulators are brought up to date lazily on the first evaluation that
+//! needs them: piece-square and pawn-pair changes come from diffing snapshots, threat
+//! changes from the recorded list, and the weight rows are applied to the accumulator a
+//! register-resident tile at a time. When the king crosses into another bucket (or over the
+//! mirror line) the accumulator is instead rebuilt from a cache holding the last accumulator
+//! seen in that bucket, diffing full attack sets against the snapshot cached with it.
 
 use crate::bitboard::*;
 use crate::types::*;
 
+/// Cycle counters per stage, compiled in with the `nnue-profile` feature; `bench` prints them.
+#[cfg(feature = "nnue-profile")]
+pub mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+    pub static THREATS: AtomicU64 = AtomicU64::new(0);
+    pub static DELTA: AtomicU64 = AtomicU64::new(0);
+    pub static UPDATE: AtomicU64 = AtomicU64::new(0);
+    pub static DOT: AtomicU64 = AtomicU64::new(0);
+    pub static PUSHES: AtomicU64 = AtomicU64::new(0);
+    pub static EVALS: AtomicU64 = AtomicU64::new(0);
+    pub static REFRESHES: AtomicU64 = AtomicU64::new(0);
+    pub static AUX_ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static AUX_ROWS_REFRESH: AtomicU64 = AtomicU64::new(0);
+    pub static PSQT_ROWS_REFRESH: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    pub fn now() -> u64 {
+        unsafe { std::arch::x86_64::_rdtsc() }
+    }
+
+    #[inline(always)]
+    pub fn add(c: &AtomicU64, start: u64) {
+        c.fetch_add(now() - start, Relaxed);
+    }
+
+    pub fn report() -> String {
+        let pushes = PUSHES.load(Relaxed).max(1);
+        let evals = EVALS.load(Relaxed).max(1);
+        let cyc = |c: &AtomicU64| c.load(Relaxed) as f64;
+        format!(
+            "nnue profile: pushes {} evals {} refreshes {} aux rows/eval {:.1} (per refresh {:.1} aux, {:.1} psqt)
+  per push: snapshot {:.0} cyc
+  per eval: threats {:.0}, delta {:.0}, update {:.0}, dot {:.0} cyc",
+            pushes,
+            evals,
+            REFRESHES.load(Relaxed),
+            cyc(&AUX_ROWS) / evals as f64,
+            cyc(&AUX_ROWS_REFRESH) / REFRESHES.load(Relaxed).max(1) as f64,
+            cyc(&PSQT_ROWS_REFRESH) / REFRESHES.load(Relaxed).max(1) as f64,
+            cyc(&SNAPSHOT) / pushes as f64,
+            cyc(&THREATS) / evals as f64,
+            cyc(&DELTA) / evals as f64,
+            cyc(&UPDATE) / evals as f64,
+            cyc(&DOT) / evals as f64,
+        )
+    }
+}
+
+macro_rules! timed {
+    ($ctr:ident, $e:expr) => {{
+        #[cfg(feature = "nnue-profile")]
+        let __t = profile::now();
+        let __r = $e;
+        #[cfg(feature = "nnue-profile")]
+        profile::add(&profile::$ctr, __t);
+        __r
+    }};
+}
+
+macro_rules! count {
+    ($ctr:ident, $n:expr) => {{
+        #[cfg(feature = "nnue-profile")]
+        profile::$ctr.fetch_add($n as u64, std::sync::atomic::Ordering::Relaxed);
+    }};
+}
+
 pub const HL: usize = 1024;
 const INPUT_BUCKETS: usize = 10;
 const OUTPUT_BUCKETS: usize = 8;
-const FEATURES: usize = 768 * INPUT_BUCKETS;
+const PSQT_FEATURES: usize = 768 * INPUT_BUCKETS;
+const PP_FEATURES: usize = 96 * 95 / 2;
+const THREATS_PER_SIDE: usize = 29904;
+const AUX_FEATURES: usize = PP_FEATURES + 2 * THREATS_PER_SIDE;
 const QA: i32 = 255;
 const QB: i32 = 64;
 const SCALE: i32 = 400;
@@ -49,6 +126,341 @@ const fn expand_buckets() -> [u8; 64] {
 
 static KING_BUCKET: [u8; 64] = expand_buckets();
 
+// ---------------------------------------------------------------------------------------
+// Threat feature tables.
+//
+// A threat feature is (attacker type, attacker square, attacked square, attacked piece).
+// Attacked squares are numbered within the attacker's empty-board attack set, and each
+// attacker type only has features for some target types: pawns for knights and rooks,
+// bishops and rooks for pawns, knights, bishops and rooks, knights and queens for all
+// but kings. A piece attacking a piece of its own type is only counted from the higher
+// square, since the relation is symmetric. Kings never attack or are attacked here.
+
+const NO_TARGET: u8 = u8::MAX;
+
+struct PieceThreats {
+    attacks: [Bitboard; 64],
+    index: [u32; 64],
+    count: u32,
+    targets: [u8; 12],
+    offset: u32,
+}
+
+const fn pseudo_attacks_const(pt: usize, sq: usize) -> Bitboard {
+    let (f, r) = ((sq % 8) as i32, (sq / 8) as i32);
+    let dirs: &[(i32, i32)] = match pt {
+        1 => &[(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)],
+        2 => &[(1, 1), (1, -1), (-1, -1), (-1, 1)],
+        3 => &[(1, 0), (0, 1), (-1, 0), (0, -1)],
+        _ => &[(1, 1), (1, -1), (-1, -1), (-1, 1), (1, 0), (0, 1), (-1, 0), (0, -1)],
+    };
+    let slider = pt != 1;
+    let mut bb = 0u64;
+    let mut i = 0;
+    while i < dirs.len() {
+        let (df, dr) = dirs[i];
+        let (mut x, mut y) = (f + df, r + dr);
+        while x >= 0 && x < 8 && y >= 0 && y < 8 {
+            bb |= 1u64 << (y * 8 + x);
+            if !slider {
+                break;
+            }
+            x += df;
+            y += dr;
+        }
+        i += 1;
+    }
+    bb
+}
+
+/// Target classes 0..6 are own pieces by type, 6..12 the opponent's.
+const fn make_targets(valid: &[usize]) -> [u8; 12] {
+    let mut t = [NO_TARGET; 12];
+    let mut i = 0;
+    while i < valid.len() {
+        t[valid[i]] = i as u8;
+        t[valid[i] + 6] = (i + valid.len()) as u8;
+        i += 1;
+    }
+    t
+}
+
+const fn piece_threats(pt: usize, valid: &[usize], offset: u32) -> PieceThreats {
+    let mut attacks = [0u64; 64];
+    let mut index = [0u32; 64];
+    let mut count = 0u32;
+    let mut sq = 0;
+    while sq < 64 {
+        attacks[sq] = pseudo_attacks_const(pt, sq);
+        index[sq] = count;
+        count += attacks[sq].count_ones();
+        sq += 1;
+    }
+    PieceThreats { attacks, index, count, targets: make_targets(valid), offset }
+}
+
+const PAWN_THREATS: usize = 4 * 84;
+static PAWN_TARGETS: [u8; 12] = make_targets(&[1, 3]);
+static KNIGHT_THREATS: PieceThreats = piece_threats(1, &[0, 1, 2, 3, 4], PAWN_THREATS as u32);
+static BISHOP_THREATS: PieceThreats = piece_threats(2, &[0, 1, 2, 3], KNIGHT_THREATS.offset + 10 * KNIGHT_THREATS.count);
+static ROOK_THREATS: PieceThreats = piece_threats(3, &[0, 1, 2, 3], BISHOP_THREATS.offset + 8 * BISHOP_THREATS.count);
+static QUEEN_THREATS: PieceThreats = piece_threats(4, &[0, 1, 2, 3, 4], ROOK_THREATS.offset + 8 * ROOK_THREATS.count);
+const _: () = assert!(QUEEN_THREATS.offset + 10 * QUEEN_THREATS.count == THREATS_PER_SIDE as u32);
+
+/// Index of `d` within the attacker's empty-board attack set from `s`, plus that square's
+/// cumulative offset, for each attacker type. Precomputing this is what removes the mask and
+/// popcount from the hot path; entries for squares the attacker cannot reach are never read.
+const fn build_sq_idx() -> [[[i16; 64]; 64]; 6] {
+    let tables = all_piece_threats();
+    let mut out = [[[0i16; 64]; 64]; 6];
+    let mut pt = 0;
+    while pt < 6 {
+        let mut s = 0;
+        while s < 64 {
+            let mut d = 0;
+            while d < 64 {
+                out[pt][s][d] = if pt == 0 {
+                    // Pawn features are laid out by rank, file and capture direction. The
+                    // offset is kept signed and unguarded: a pawn on relative rank 0 (which
+                    // occurs transiently for the opponent's perspective while a promotion is
+                    // being made) underflowed in the original arithmetic, and the resulting
+                    // index is reproduced here exactly. It is harmless because the same
+                    // index is both added and subtracted within the move, so it cancels.
+                    let rank = (s / 8) as i32;
+                    let diff = if d > s { d - s } else { s - d };
+                    let id = if diff == if d > s { 7 } else { 9 } { 0 } else { 1 };
+                    let attack = 2 * (s % 8) as i32 + id - 1;
+                    ((rank - 1) * 14 + attack) as i16
+                } else if pt < 5 {
+                    let t = &tables[pt - 1];
+                    let below = if d == 63 { u64::MAX >> 1 } else { (1u64 << d) - 1 };
+                    (t.index[s] + (t.attacks[s] & below).count_ones()) as i16
+                } else {
+                    0
+                };
+                d += 1;
+            }
+            s += 1;
+        }
+        pt += 1;
+    }
+    out
+}
+
+/// The four non-pawn attacker tables, rebuilt once in const context so the lookup tables
+/// below do not have to read the statics.
+const fn all_piece_threats() -> [PieceThreats; 4] {
+    let knight = piece_threats(1, &[0, 1, 2, 3, 4], PAWN_THREATS as u32);
+    let bishop = piece_threats(2, &[0, 1, 2, 3], knight.offset + 10 * knight.count);
+    let rook = piece_threats(3, &[0, 1, 2, 3], bishop.offset + 8 * bishop.count);
+    let queen = piece_threats(4, &[0, 1, 2, 3, 4], rook.offset + 8 * rook.count);
+    [knight, bishop, rook, queen]
+}
+
+/// Everything about a (attacker, target, direction) triple that does not depend on the
+/// squares: the side block, the attacker's block, and the target's slot within it.
+/// `u32::MAX` marks a pair the network has no input for. Pieces are perspective-relative,
+/// so 0..6 are the perspective's own and 6..12 the opponent's.
+const fn build_lut1() -> [[[u32; 2]; 12]; 12] {
+    let tables = all_piece_threats();
+    let mut out = [[[u32::MAX; 2]; 12]; 12];
+    let mut ra = 0;
+    while ra < 12 {
+        let pt = ra % 6;
+        let side = (ra / 6) as u32;
+        let mut rt = 0;
+        while rt < 12 {
+            let mut dir = 0;
+            while dir < 2 {
+                // dir == 1 means the target square is above the attacker's.
+                let excluded_same_type = dir == 1 && rt % 6 == pt;
+                let value = if pt == 0 {
+                    let m = make_targets(&[1, 3])[rt];
+                    if m == NO_TARGET { u32::MAX } else { m as u32 * 84 }
+                } else if pt < 5 {
+                    let t = &tables[pt - 1];
+                    let m = t.targets[rt];
+                    if m == NO_TARGET || excluded_same_type {
+                        u32::MAX
+                    } else {
+                        t.offset + m as u32 * t.count
+                    }
+                } else {
+                    u32::MAX
+                };
+                out[ra][rt][dir] = if value == u32::MAX {
+                    u32::MAX
+                } else {
+                    PP_FEATURES as u32 + THREATS_PER_SIDE as u32 * side + value
+                };
+                dir += 1;
+            }
+            rt += 1;
+        }
+        ra += 1;
+    }
+    out
+}
+
+static SQ_IDX: [[[i16; 64]; 64]; 6] = build_sq_idx();
+static THREAT_LUT: [[[u32; 2]; 12]; 12] = build_lut1();
+
+/// `pc` as seen from `p`: the perspective's own pieces occupy 0..6 and the opponent's 6..12.
+#[inline(always)]
+fn relative_piece(pc: Piece, p: Color) -> usize {
+    let i = pc.idx();
+    if p == Color::White { i } else { (i + 6) % 12 }
+}
+
+/// Threat feature index from `p`'s perspective, or `None` for pairs the net has no input for.
+#[inline(always)]
+fn threat_feature(attacker: Piece, src: Square, dest: Square, target: Piece, p: Color, flip: u8) -> Option<usize> {
+    let s = (relative_square(p, src) ^ flip) as usize;
+    let d = (relative_square(p, dest) ^ flip) as usize;
+    let ra = relative_piece(attacker, p);
+    let rt = relative_piece(target, p);
+    threat_index(ra, rt, s, d)
+}
+
+/// The table lookup itself: perspective-relative attacker and target, oriented squares.
+#[inline(always)]
+fn threat_index(ra: usize, rt: usize, s: usize, d: usize) -> Option<usize> {
+    let base = THREAT_LUT[ra][rt][(d > s) as usize];
+    if base == u32::MAX {
+        return None;
+    }
+    Some((base as i64 + SQ_IDX[ra % 6][s][d] as i64) as usize)
+}
+
+/// Pawn-pair feature index from `p`'s perspective for pawns `a` and `b` (any colours).
+#[inline]
+fn pp_feature(ca: Color, sa: Square, cb: Color, sb: Square, p: Color, flip: u8) -> usize {
+    let id = |c: Color, s: Square| ((c != p) as usize) * 48 + (relative_square(p, s) ^ flip) as usize - 8;
+    let (a, b) = (id(ca, sa), id(cb, sb));
+    let (lo, hi) = (a.min(b), a.max(b));
+    debug_assert!(lo != hi);
+    hi * (hi - 1) / 2 + lo
+}
+
+/// Pawns pair with pawns on the same or an adjacent file.
+#[inline(always)]
+fn pawn_band(sq: Square) -> Bitboard {
+    file_bb(sq) | adjacent_files_bb(sq)
+}
+
+/// Squares on the line from `a` through `b` to the edge, from `b` onward but also the
+/// squares strictly between `a` and `b`; empty when the two are not aligned.
+const fn ray_pass_table() -> [[Bitboard; 64]; 64] {
+    let mut t = [[0u64; 64]; 64];
+    let mut a = 0;
+    while a < 64 {
+        let mut b = 0;
+        while b < 64 {
+            if a != b {
+                let (df, dr) = ((b % 8) as i32 - (a % 8) as i32, (b / 8) as i32 - (a / 8) as i32);
+                if df == 0 || dr == 0 || df.abs() == dr.abs() {
+                    let (sf, sr) = (df.signum(), dr.signum());
+                    let (mut f, mut r) = ((a % 8) as i32 + sf, (a / 8) as i32 + sr);
+                    while f >= 0 && f < 8 && r >= 0 && r < 8 {
+                        t[a][b] |= 1u64 << (r * 8 + f);
+                        f += sf;
+                        r += sr;
+                    }
+                }
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    t
+}
+
+static RAY_PASS: [[Bitboard; 64]; 64] = ray_pass_table();
+
+/// One threat that appeared or vanished during a move: `attacker` on `from` attacking
+/// `target` on `to`. Packed so a ply's list copies cheaply.
+#[derive(Clone, Copy)]
+pub struct DirtyThreat(u32);
+
+impl DirtyThreat {
+    #[inline(always)]
+    fn new(add: bool, attacker: Piece, target: Piece, from: Square, to: Square) -> DirtyThreat {
+        DirtyThreat(
+            (add as u32) << 31 | (attacker.0 as u32) << 24 | (target.0 as u32) << 16 | (from as u32) << 8 | to as u32,
+        )
+    }
+    #[inline(always)]
+    fn add(self) -> bool {
+        self.0 >> 31 != 0
+    }
+    #[inline(always)]
+    fn attacker(self) -> Piece {
+        Piece((self.0 >> 24 & 0x7f) as u8)
+    }
+    #[inline(always)]
+    fn target(self) -> Piece {
+        Piece((self.0 >> 16 & 0xff) as u8)
+    }
+    #[inline(always)]
+    fn from(self) -> Square {
+        (self.0 >> 8 & 0xff) as Square
+    }
+    #[inline(always)]
+    fn to(self) -> Square {
+        (self.0 & 0xff) as Square
+    }
+}
+
+pub const MAX_DIRTY_THREATS: usize = 96;
+
+/// The threats a move changed, recorded by the board primitives as they run.
+#[derive(Clone, Copy)]
+pub struct DirtyThreats {
+    list: [DirtyThreat; MAX_DIRTY_THREATS],
+    n: u8,
+    /// More changed than fit: the ply falls back to diffing snapshots.
+    overflow: bool,
+}
+
+impl DirtyThreats {
+    const EMPTY: DirtyThreats = DirtyThreats { list: [DirtyThreat(0); MAX_DIRTY_THREATS], n: 0, overflow: false };
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.n = 0;
+        self.overflow = false;
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, add: bool, attacker: Piece, target: Piece, from: Square, to: Square) {
+        if (self.n as usize) < MAX_DIRTY_THREATS {
+            self.list[self.n as usize] = DirtyThreat::new(add, attacker, target, from, to);
+            self.n += 1;
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    fn as_slice(&self) -> &[DirtyThreat] {
+        &self.list[..self.n as usize]
+    }
+}
+
+/// Whether `slider` has a threat input for attacking `target`: queens are only targets
+/// of queens.
+#[inline(always)]
+pub fn can_slider_threat(target: Piece, slider: Piece) -> bool {
+    target.piece_type() != PieceType::Queen || slider.piece_type() == PieceType::Queen
+}
+
+/// Squares from `a` (exclusive) through `b` to the edge of the board.
+#[inline(always)]
+pub fn ray_pass(a: Square, b: Square) -> Bitboard {
+    RAY_PASS[a as usize][b as usize]
+}
+
+// ---------------------------------------------------------------------------------------
+
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Accumulator {
@@ -57,7 +469,8 @@ pub struct Accumulator {
 
 #[repr(C)]
 struct Network {
-    ft_weights: [Accumulator; FEATURES],
+    psqt_weights: [Accumulator; PSQT_FEATURES],
+    aux_weights: [[i8; HL]; AUX_FEATURES],
     ft_bias: Accumulator,
     out_weights: [[i16; 2 * HL]; OUTPUT_BUCKETS],
     out_bias: [i16; OUTPUT_BUCKETS],
@@ -66,31 +479,441 @@ struct Network {
 /// The network file is padded to a 64-byte multiple, which is exactly the struct's size.
 static NET: Network = unsafe { std::mem::transmute(*include_bytes!(env!("PERAS_NET"))) };
 
-/// One board change: `from` and/or `to` may be `SQ_NONE`.
+/// What the network sees of a position: the board, every non-king piece's attacks on
+/// non-king pieces, and where the pawns and kings are.
 #[derive(Clone, Copy)]
-pub struct DirtyPiece {
-    pc: Piece,
-    from: Square,
-    to: Square,
+pub struct Snapshot {
+    board: [Piece; 64],
+    /// Attack sets, filled in by `ensure_threats` the first time a diff needs them.
+    threats: [Bitboard; 64],
+    threats_ready: bool,
+    /// All pieces but the kings: the possible attackers and targets.
+    attackers: Bitboard,
+    occ: Bitboard,
+    pawns: [Bitboard; 2],
+    kings: [Square; 2],
+    by_type: [Bitboard; 6],
+    by_color: [Bitboard; 2],
 }
 
-const NO_DIRTY: DirtyPiece = DirtyPiece { pc: Piece::NONE, from: SQ_NONE, to: SQ_NONE };
+impl Snapshot {
+    pub const EMPTY: Snapshot = Snapshot {
+        board: [Piece::NONE; 64],
+        threats: [0; 64],
+        threats_ready: true,
+        attackers: 0,
+        occ: 0,
+        pawns: [0; 2],
+        kings: [SQ_NONE; 2],
+        by_type: [0; 6],
+        by_color: [0; 2],
+    };
 
-/// A move touches at most four primitives (castling and capture promotions both take four).
-pub const MAX_DIRTY: usize = 4;
+    #[inline]
+    pub fn build(board: &[Piece; 64], by_type: &[Bitboard; 6], by_color: &[Bitboard; 2], kings: [Square; 2]) -> Snapshot {
+        count!(PUSHES, 1);
+        timed!(SNAPSHOT, Self::build_inner(board, by_type, by_color, kings))
+    }
+
+    #[inline]
+    fn build_inner(board: &[Piece; 64], by_type: &[Bitboard; 6], by_color: &[Bitboard; 2], kings: [Square; 2]) -> Snapshot {
+        let occ = by_color[0] | by_color[1];
+        let pawns = [by_type[0] & by_color[0], by_type[0] & by_color[1]];
+        let mut king_bb = 0;
+        for k in kings {
+            if k != SQ_NONE {
+                king_bb |= sq_bb(k);
+            }
+        }
+        Snapshot {
+            board: *board,
+            threats: [0; 64],
+            threats_ready: false,
+            attackers: occ & !king_bb,
+            occ,
+            pawns,
+            kings,
+            by_type: *by_type,
+            by_color: *by_color,
+        }
+    }
+
+    /// Non-king pieces attacking `t`.
+    #[inline]
+    fn attackers_of(&self, t: Square) -> Bitboard {
+        let q = self.by_type[PieceType::Queen.idx()];
+        let p = self.by_type[PieceType::Pawn.idx()];
+        ((rook_attacks(t, self.occ) & (self.by_type[PieceType::Rook.idx()] | q))
+            | (bishop_attacks(t, self.occ) & (self.by_type[PieceType::Bishop.idx()] | q))
+            | (knight_attacks(t) & self.by_type[PieceType::Knight.idx()])
+            | (pawn_attacks(Color::Black, t) & p & self.by_color[0])
+            | (pawn_attacks(Color::White, t) & p & self.by_color[1]))
+            & self.attackers
+    }
+
+    fn ensure_threats(&mut self) {
+        if self.threats_ready {
+            return;
+        }
+        timed!(THREATS, self.compute_threats());
+    }
+
+    fn compute_threats(&mut self) {
+        let mut b = self.attackers;
+        while b != 0 {
+            let sq = pop_lsb(&mut b);
+            let pc = self.board[sq as usize];
+            let att = match pc.piece_type() {
+                PieceType::Pawn => pawn_attacks(pc.color(), sq),
+                pt => attacks_bb(pt, sq, self.occ),
+            };
+            self.threats[sq as usize] = att & self.attackers;
+        }
+        self.threats_ready = true;
+    }
+}
+
+/// Bitboard of the squares whose piece differs between snapshots.
+#[inline]
+fn board_diff(old: &Snapshot, new: &Snapshot) -> Bitboard {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut board_changed = 0u64;
+        for half in 0..2 {
+            let a = _mm256_loadu_si256(old.board.as_ptr().add(32 * half) as *const __m256i);
+            let b = _mm256_loadu_si256(new.board.as_ptr().add(32 * half) as *const __m256i);
+            let same = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32;
+            board_changed |= u64::from(!same) << (32 * half);
+        }
+        board_changed
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let mut board_changed = 0u64;
+        for sq in 0..64 {
+            if old.board[sq] != new.board[sq] {
+                board_changed |= 1 << sq;
+            }
+        }
+        board_changed
+    }
+}
+
+/// Bitboards of the squares whose piece, and whose attack set, differ between snapshots.
+#[inline]
+fn snapshot_diff(old: &Snapshot, new: &Snapshot) -> (Bitboard, Bitboard) {
+    debug_assert!(old.threats_ready && new.threats_ready);
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut board_changed = 0u64;
+        for half in 0..2 {
+            let a = _mm256_loadu_si256(old.board.as_ptr().add(32 * half) as *const __m256i);
+            let b = _mm256_loadu_si256(new.board.as_ptr().add(32 * half) as *const __m256i);
+            let same = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32;
+            board_changed |= u64::from(!same) << (32 * half);
+        }
+        let mut map_changed = 0u64;
+        for q in 0..16 {
+            let a = _mm256_loadu_si256(old.threats.as_ptr().add(4 * q) as *const __m256i);
+            let b = _mm256_loadu_si256(new.threats.as_ptr().add(4 * q) as *const __m256i);
+            let same = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, b))) as u64;
+            map_changed |= (!same & 0xf) << (4 * q);
+        }
+        (board_changed, map_changed)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let mut board_changed = 0u64;
+        let mut map_changed = 0u64;
+        for sq in 0..64 {
+            if old.board[sq] != new.board[sq] {
+                board_changed |= 1 << sq;
+            }
+            if old.threats[sq] != new.threats[sq] {
+                map_changed |= 1 << sq;
+            }
+        }
+        (board_changed, map_changed)
+    }
+}
+
+const MAX_PSQT_DELTA: usize = 32;
+const MAX_AUX_DELTA: usize = 512;
+
+/// Feature changes for one perspective.
+struct Lists {
+    psqt_add: [usize; MAX_PSQT_DELTA],
+    psqt_sub: [usize; MAX_PSQT_DELTA],
+    aux_add: [usize; MAX_AUX_DELTA],
+    aux_sub: [usize; MAX_AUX_DELTA],
+    n_psqt_add: usize,
+    n_psqt_sub: usize,
+    n_aux_add: usize,
+    n_aux_sub: usize,
+}
+
+impl Lists {
+    const fn new() -> Lists {
+        Lists {
+            psqt_add: [0; MAX_PSQT_DELTA],
+            psqt_sub: [0; MAX_PSQT_DELTA],
+            aux_add: [0; MAX_AUX_DELTA],
+            aux_sub: [0; MAX_AUX_DELTA],
+            n_psqt_add: 0,
+            n_psqt_sub: 0,
+            n_aux_add: 0,
+            n_aux_sub: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.n_psqt_add = 0;
+        self.n_psqt_sub = 0;
+        self.n_aux_add = 0;
+        self.n_aux_sub = 0;
+    }
+
+    #[inline(always)]
+    fn psqt(&mut self, f: usize, add: bool) {
+        if add {
+            self.psqt_add[self.n_psqt_add] = f;
+            self.n_psqt_add += 1;
+        } else {
+            self.psqt_sub[self.n_psqt_sub] = f;
+            self.n_psqt_sub += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn aux(&mut self, f: usize, add: bool) {
+        // Start pulling the row in now; the rest of the enumeration hides the latency.
+        #[cfg(target_feature = "avx2")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            // Pull in the first half of the row only. Requesting all sixteen lines of every
+            // row floods the load buffers, and the hardware prefetcher streams the rest once
+            // the update starts reading the row; measured 5% faster over 17 paired runs.
+            let row = NET.aux_weights[f].as_ptr();
+            let mut line = 0;
+            while line < HL / 2 {
+                _mm_prefetch(row.add(line), _MM_HINT_T0);
+                line += 64;
+            }
+        }
+        if add {
+            self.aux_add[self.n_aux_add] = f;
+            self.n_aux_add += 1;
+        } else {
+            self.aux_sub[self.n_aux_sub] = f;
+            self.n_aux_sub += 1;
+        }
+    }
+}
+
+/// Perspective, king bucket and mirror flag a delta is mapped for.
+#[derive(Clone, Copy)]
+struct View {
+    p: Color,
+    bucket: usize,
+    flip: u8,
+}
+
+/// Feature changes between two snapshots, enumerated once and mapped for up to two
+/// perspectives at a time.
+struct Delta {
+    lists: [Lists; 2],
+    views: [Option<View>; 2],
+}
+
+impl Delta {
+    fn new() -> Box<Delta> {
+        Box::new(Delta { lists: [Lists::new(), Lists::new()], views: [None; 2] })
+    }
+
+    #[inline(always)]
+    fn psqt(&mut self, pc: Piece, sq: Square, add: bool) {
+        for k in 0..2 {
+            if let Some(v) = self.views[k] {
+                self.lists[k].psqt(psqt_feature(v.p, v.bucket, v.flip, pc, sq), add);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn threat(&mut self, attacker: Piece, src: Square, dest: Square, target: Piece, add: bool) {
+        for k in 0..2 {
+            if let Some(v) = self.views[k] {
+                if let Some(f) = threat_feature(attacker, src, dest, target, v.p, v.flip) {
+                    self.lists[k].aux(f, add);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn pp(&mut self, ca: Color, sa: Square, cb: Color, sb: Square, add: bool) {
+        for k in 0..2 {
+            if let Some(v) = self.views[k] {
+                self.lists[k].aux(pp_feature(ca, sa, cb, sb, v.p, v.flip), add);
+            }
+        }
+    }
+
+    /// All threat features of the attacker on `s` in `snap`.
+    fn threats_of(&mut self, snap: &Snapshot, s: Square, add: bool) {
+        let pc = snap.board[s as usize];
+        let mut b = snap.threats[s as usize];
+        while b != 0 {
+            let d = pop_lsb(&mut b);
+            self.threat(pc, s, d, snap.board[d as usize], add);
+        }
+    }
+
+    /// Fills the lists from a move's recorded threat changes plus the board and pawn
+    /// differences between the snapshots; no attack sets are needed.
+    fn compute_from_dirty(&mut self, old: &Snapshot, new: &Snapshot, dirty: &DirtyThreats) {
+        self.lists[0].clear();
+        self.lists[1].clear();
+        let board_changed = board_diff(old, new);
+        self.psqt_changes(old, new, board_changed);
+        for d in dirty.as_slice() {
+            self.threat(d.attacker(), d.from(), d.to(), d.target(), d.add());
+        }
+        self.pawn_pair_changes(old, new);
+    }
+
+    /// Piece-square features for the squares whose piece changed.
+    #[inline]
+    fn psqt_changes(&mut self, old: &Snapshot, new: &Snapshot, board_changed: Bitboard) {
+        let mut b = board_changed;
+        while b != 0 {
+            let sq = pop_lsb(&mut b);
+            let (o, n) = (old.board[sq as usize], new.board[sq as usize]);
+            if !o.is_none() {
+                self.psqt(o, sq, false);
+            }
+            if !n.is_none() {
+                self.psqt(n, sq, true);
+            }
+        }
+    }
+
+    /// Fills the lists of every set view with what differs between `old` and `new`,
+    /// from their attack sets.
+    fn compute(&mut self, old: &Snapshot, new: &Snapshot) {
+        self.lists[0].clear();
+        self.lists[1].clear();
+
+        let (board_changed, map_changed) = snapshot_diff(old, new);
+        let changed = board_changed | map_changed;
+        self.psqt_changes(old, new, board_changed);
+
+        // Attackers whose piece changed: replace all their threats.
+        let mut b = board_changed & old.attackers;
+        while b != 0 {
+            let s = pop_lsb(&mut b);
+            self.threats_of(old, s, false);
+        }
+        let mut b = board_changed & new.attackers;
+        while b != 0 {
+            let s = pop_lsb(&mut b);
+            self.threats_of(new, s, true);
+        }
+
+        // Same piece, different attack set (a line opened or closed): only the targets
+        // that appeared or vanished, plus kept targets whose piece changed.
+        let mut b = map_changed & !board_changed;
+        while b != 0 {
+            let s = pop_lsb(&mut b);
+            let pc = old.board[s as usize];
+            let (o, n) = (old.threats[s as usize], new.threats[s as usize]);
+            let mut gone = o & !n;
+            while gone != 0 {
+                let d = pop_lsb(&mut gone);
+                self.threat(pc, s, d, old.board[d as usize], false);
+            }
+            let mut fresh = n & !o;
+            while fresh != 0 {
+                let d = pop_lsb(&mut fresh);
+                self.threat(pc, s, d, new.board[d as usize], true);
+            }
+            let mut swapped = o & n & board_changed;
+            while swapped != 0 {
+                let d = pop_lsb(&mut swapped);
+                self.threat(pc, s, d, old.board[d as usize], false);
+                self.threat(pc, s, d, new.board[d as usize], true);
+            }
+        }
+
+        // Unchanged attackers looking at a square whose piece changed. Such a square holds
+        // a target both before and after, else the attack set would have changed too.
+        let stable = old.attackers & !changed;
+        let mut b = board_changed & old.attackers;
+        while b != 0 {
+            let t = pop_lsb(&mut b);
+            let mut a = stable & old.attackers_of(t);
+            while a != 0 {
+                let s = pop_lsb(&mut a);
+                debug_assert!(old.threats[s as usize] & sq_bb(t) != 0);
+                let pc = old.board[s as usize];
+                self.threat(pc, s, t, old.board[t as usize], false);
+                self.threat(pc, s, t, new.board[t as usize], true);
+            }
+        }
+
+        self.pawn_pair_changes(old, new);
+    }
+
+    /// Pawn pairs: dissolve pairs of removed pawns, then form pairs of added pawns.
+    fn pawn_pair_changes(&mut self, old: &Snapshot, new: &Snapshot) {
+        let mut w = old.pawns;
+        for c in [Color::White, Color::Black] {
+            let mut removed = old.pawns[c.idx()] & !new.pawns[c.idx()];
+            while removed != 0 {
+                let r = pop_lsb(&mut removed);
+                w[c.idx()] &= !sq_bb(r);
+                for c2 in [Color::White, Color::Black] {
+                    let mut x = w[c2.idx()] & pawn_band(r);
+                    while x != 0 {
+                        let s = pop_lsb(&mut x);
+                        self.pp(c, r, c2, s, false);
+                    }
+                }
+            }
+        }
+        for c in [Color::White, Color::Black] {
+            let mut added = new.pawns[c.idx()] & !old.pawns[c.idx()];
+            while added != 0 {
+                let a = pop_lsb(&mut added);
+                for c2 in [Color::White, Color::Black] {
+                    let mut x = w[c2.idx()] & pawn_band(a);
+                    while x != 0 {
+                        let s = pop_lsb(&mut x);
+                        self.pp(c, a, c2, s, true);
+                    }
+                }
+                w[c.idx()] |= sq_bb(a);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct AccEntry {
     acc: [Accumulator; 2],
     computed: [bool; 2],
-    dirty: [DirtyPiece; MAX_DIRTY],
-    n_dirty: u8,
+    snap: Snapshot,
+    /// Threat changes of the move into this ply, when they were recorded in full.
+    dirty: DirtyThreats,
+    dirty_valid: bool,
 }
 
 #[derive(Clone, Copy)]
 struct CacheEntry {
     acc: Accumulator,
-    pieces: [Bitboard; 12],
+    snap: Snapshot,
 }
 
 /// Per perspective, per (king bucket, mirror) accumulator cache.
@@ -101,68 +924,106 @@ struct Cache {
 
 impl Cache {
     fn new() -> Box<Cache> {
-        Box::new(Cache { entries: [[CacheEntry { acc: NET.ft_bias, pieces: [0; 12] }; 2 * INPUT_BUCKETS]; 2] })
+        Box::new(Cache { entries: [[CacheEntry { acc: NET.ft_bias, snap: Snapshot::EMPTY }; 2 * INPUT_BUCKETS]; 2] })
     }
 }
 
 /// Everything the network needs that lives alongside a `Position`.
-#[derive(Clone)]
 pub struct NnueState {
     stack: Vec<AccEntry>,
     top: usize,
     cache: Box<Cache>,
-    dirty: [DirtyPiece; MAX_DIRTY],
-    n_dirty: u8,
+    delta: Box<Delta>,
+    /// Threat changes of the move being made, filled by the board primitives.
+    pub dirty: DirtyThreats,
+    /// True between `begin` and `push`: the primitives are making a move, not unmaking
+    /// one or setting up a position.
+    pub recording: bool,
+}
+
+impl Clone for NnueState {
+    fn clone(&self) -> Self {
+        NnueState {
+            stack: self.stack.clone(),
+            top: self.top,
+            cache: self.cache.clone(),
+            delta: Delta::new(),
+            dirty: DirtyThreats::EMPTY,
+            recording: false,
+        }
+    }
 }
 
 impl NnueState {
     pub fn new() -> NnueState {
-        let root = AccEntry { acc: [NET.ft_bias; 2], computed: [false; 2], dirty: [NO_DIRTY; MAX_DIRTY], n_dirty: 0 };
+        let root = AccEntry {
+            acc: [NET.ft_bias; 2],
+            computed: [false; 2],
+            snap: Snapshot::EMPTY,
+            dirty: DirtyThreats::EMPTY,
+            dirty_valid: false,
+        };
         let mut stack = Vec::with_capacity(64);
         stack.push(root);
-        NnueState { stack, top: 0, cache: Cache::new(), dirty: [NO_DIRTY; MAX_DIRTY], n_dirty: 0 }
+        NnueState { stack, top: 0, cache: Cache::new(), delta: Delta::new(), dirty: DirtyThreats::EMPTY, recording: false }
+    }
+
+    /// Starts recording the threat changes of a move.
+    #[inline(always)]
+    pub fn begin(&mut self) {
+        self.dirty.clear();
+        self.recording = true;
     }
 
     /// Forgets everything: the board was set up from scratch.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, snap: Snapshot) {
         self.top = 0;
         self.stack[0].computed = [false; 2];
-        self.stack[0].n_dirty = 0;
-        self.n_dirty = 0;
+        self.stack[0].snap = snap;
+        self.stack[0].dirty_valid = false;
+        self.recording = false;
     }
 
-    /// Starts recording the changes of a new move.
-    #[inline(always)]
-    pub fn begin(&mut self) {
-        self.n_dirty = 0;
-    }
-
-    /// Records one board primitive.
-    #[inline(always)]
-    pub fn record(&mut self, pc: Piece, from: Square, to: Square) {
-        let n = self.n_dirty as usize;
-        if n < MAX_DIRTY {
-            self.dirty[n] = DirtyPiece { pc, from, to };
+    /// Opens the ply after a move, given the resulting position.
+    #[inline]
+    pub fn push(&mut self, snap: Snapshot) {
+        let valid = self.recording && !self.dirty.overflow;
+        self.recording = false;
+        self.open(snap);
+        let e = &mut self.stack[self.top];
+        e.dirty_valid = valid;
+        if valid {
+            e.dirty.n = self.dirty.n;
+            e.dirty.list[..self.dirty.n as usize].copy_from_slice(self.dirty.as_slice());
         }
-        self.n_dirty += 1;
     }
 
-    /// Opens the ply after the recorded move.
-    #[inline(always)]
-    pub fn push(&mut self) {
+    /// Opens the ply after a null move: the board is unchanged, nothing is dirty.
+    #[inline]
+    pub fn push_same(&mut self) {
+        let snap = self.stack[self.top].snap;
+        self.open(snap);
+        let e = &mut self.stack[self.top];
+        e.dirty.n = 0;
+        e.dirty_valid = true;
+    }
+
+    #[inline]
+    fn open(&mut self, snap: Snapshot) {
         self.top += 1;
         if self.top == self.stack.len() {
             self.stack.push(AccEntry {
                 acc: [NET.ft_bias; 2],
                 computed: [false; 2],
-                dirty: [NO_DIRTY; MAX_DIRTY],
-                n_dirty: 0,
+                snap,
+                dirty: DirtyThreats::EMPTY,
+                dirty_valid: false,
             });
+        } else {
+            let e = &mut self.stack[self.top];
+            e.computed = [false; 2];
+            e.snap = snap;
         }
-        let e = &mut self.stack[self.top];
-        e.computed = [false; 2];
-        e.dirty = self.dirty;
-        e.n_dirty = self.n_dirty;
     }
 
     #[inline(always)]
@@ -171,110 +1032,153 @@ impl NnueState {
         self.top -= 1;
     }
 
-    /// Side-to-move relative evaluation in centipawns.
-    ///
-    /// `pieces` is indexed by `Piece::idx()`; `count` is the number of pieces on the board.
-    pub fn evaluate(&mut self, stm: Color, kings: [Square; 2], pieces: &[Bitboard; 12], count: i32) -> i32 {
-        for p in [Color::White, Color::Black] {
-            if !self.stack[self.top].computed[p.idx()] {
-                self.bring_up_to_date(p, kings[p.idx()], pieces);
-            }
+    /// Side-to-move relative evaluation in centipawns; `count` is the number of pieces.
+    pub fn evaluate(&mut self, stm: Color, count: i32) -> i32 {
+        let computed = self.stack[self.top].computed;
+        match computed {
+            [false, false] => self.update_both(),
+            [false, true] => self.update_one(Color::White),
+            [true, false] => self.update_one(Color::Black),
+            [true, true] => {}
         }
         let e = &self.stack[self.top];
         let bucket = ((count - 2).max(0) as usize / (32 / OUTPUT_BUCKETS)).min(OUTPUT_BUCKETS - 1);
         let w = &NET.out_weights[bucket];
         let (us, them) = (&e.acc[stm.idx()], &e.acc[stm.flip().idx()]);
-        let sum = simd::dot_screlu(us, &w[..HL]) + simd::dot_screlu(them, &w[HL..]);
+        count!(EVALS, 1);
+        let sum = timed!(DOT, simd::dot_screlu(us, &w[..HL]) + simd::dot_screlu(them, &w[HL..]));
         (sum / QA + i32::from(NET.out_bias[bucket])) * SCALE / (QA * QB)
     }
 
-    fn bring_up_to_date(&mut self, p: Color, ksq: Square, pieces: &[Bitboard; 12]) {
-        let top = self.top;
-        let mut i = top;
+    /// How to bring `p`'s top accumulator up to date: rebuild it from the cache, or replay
+    /// the plies from the given index (whose predecessor is computed).
+    fn plan(&self, p: Color) -> Option<usize> {
+        let mut i = self.top;
         loop {
             if i == 0 || self.needs_refresh(i, p) {
-                self.refresh(p, ksq, pieces);
-                return;
+                return None;
             }
             if self.stack[i - 1].computed[p.idx()] {
-                break;
+                return Some(i);
             }
             i -= 1;
         }
-        let (bucket, flip) = king_context(p, ksq);
-        for j in i..=top {
-            let (before, after) = self.stack.split_at_mut(j);
-            let src = &before[j - 1].acc[p.idx()];
-            let e = &mut after[0];
-            let mut adds = [0usize; MAX_DIRTY];
-            let mut subs = [0usize; MAX_DIRTY];
-            let (mut na, mut ns) = (0, 0);
-            for d in &e.dirty[..e.n_dirty as usize] {
-                if d.from != SQ_NONE {
-                    subs[ns] = feature(p, bucket, flip, d.pc, d.from);
-                    ns += 1;
+    }
+
+    fn update_one(&mut self, p: Color) {
+        match self.plan(p) {
+            None => self.refresh(p),
+            Some(i) => self.replay(i, [p == Color::White, p == Color::Black]),
+        }
+    }
+
+    /// Both perspectives share one pass over the changed features whenever they replay
+    /// the same plies.
+    fn update_both(&mut self) {
+        match (self.plan(Color::White), self.plan(Color::Black)) {
+            (Some(a), Some(b)) if a == b => self.replay(a, [true, true]),
+            (w, b) => {
+                match w {
+                    None => self.refresh(Color::White),
+                    Some(i) => self.replay(i, [true, false]),
                 }
-                if d.to != SQ_NONE {
-                    adds[na] = feature(p, bucket, flip, d.pc, d.to);
-                    na += 1;
+                match b {
+                    None => self.refresh(Color::Black),
+                    Some(i) => self.replay(i, [false, true]),
                 }
             }
-            simd::update(src, &mut e.acc[p.idx()], &adds[..na], &subs[..ns]);
-            e.computed[p.idx()] = true;
+        }
+    }
+
+    fn view(&self, p: Color) -> View {
+        let (bucket, flip) = king_context(p, self.stack[self.top].snap.kings[p.idx()]);
+        View { p, bucket, flip }
+    }
+
+    /// Replays plies `i..=top` for the selected perspectives.
+    fn replay(&mut self, i: usize, which: [bool; 2]) {
+        let top = self.top;
+        for k in 0..2 {
+            let p = Color::from_idx(k);
+            self.delta.views[k] = if which[k] { Some(self.view(p)) } else { None };
+        }
+        for j in i..=top {
+            let (before, after) = self.stack.split_at_mut(j);
+            let src = &mut before[j - 1];
+            let e = &mut after[0];
+            if e.dirty_valid {
+                timed!(DELTA, self.delta.compute_from_dirty(&src.snap, &e.snap, &e.dirty));
+            } else {
+                src.snap.ensure_threats();
+                e.snap.ensure_threats();
+                timed!(DELTA, self.delta.compute(&src.snap, &e.snap));
+            }
+            for k in 0..2 {
+                if which[k] {
+                    count!(AUX_ROWS, self.delta.lists[k].n_aux_add + self.delta.lists[k].n_aux_sub);
+                    timed!(UPDATE, simd::update(&src.acc[k], &mut e.acc[k], &self.delta.lists[k]));
+                    e.computed[k] = true;
+                }
+            }
         }
     }
 
     /// Whether the move into ply `i` moved `p`'s king to another bucket or across the
-    /// mirror line (or recorded more changes than fit, which only happens on setup).
+    /// mirror line.
+    #[inline]
     fn needs_refresh(&self, i: usize, p: Color) -> bool {
-        let e = &self.stack[i];
-        if e.n_dirty as usize > MAX_DIRTY {
-            return true;
-        }
-        let king = Piece::make(p, PieceType::King);
-        let (mut from, mut to) = (SQ_NONE, SQ_NONE);
-        for d in &e.dirty[..e.n_dirty as usize] {
-            if d.pc == king {
-                if d.from != SQ_NONE {
-                    from = d.from;
-                }
-                if d.to != SQ_NONE {
-                    to = d.to;
-                }
-            }
-        }
-        if from == SQ_NONE {
-            return false;
-        }
-        to == SQ_NONE || king_context(p, from) != king_context(p, to)
+        let (from, to) = (self.stack[i - 1].snap.kings[p.idx()], self.stack[i].snap.kings[p.idx()]);
+        from != to && king_context(p, from) != king_context(p, to)
     }
 
     /// Rebuilds the top accumulator for `p` from the cache entry of its king bucket.
-    fn refresh(&mut self, p: Color, ksq: Square, pieces: &[Bitboard; 12]) {
-        let (bucket, flip) = king_context(p, ksq);
-        let entry = &mut self.cache.entries[p.idx()][2 * bucket + (flip != 0) as usize];
-        let mut adds = [0usize; 32];
-        let mut subs = [0usize; 32];
-        let (mut na, mut ns) = (0, 0);
-        for pc in 0..12 {
-            let piece = Piece(pc as u8);
-            let mut added = pieces[pc] & !entry.pieces[pc];
-            while added != 0 {
-                adds[na] = feature(p, bucket, flip, piece, pop_lsb(&mut added));
-                na += 1;
-            }
-            let mut removed = entry.pieces[pc] & !pieces[pc];
-            while removed != 0 {
-                subs[ns] = feature(p, bucket, flip, piece, pop_lsb(&mut removed));
-                ns += 1;
-            }
-        }
-        simd::update_in_place(&mut entry.acc, &adds[..na], &subs[..ns]);
-        entry.pieces = *pieces;
+    fn refresh(&mut self, p: Color) {
+        self.stack[self.top].snap.ensure_threats();
+        let k = p.idx();
+        let view = self.view(p);
+        self.delta.views = [None; 2];
+        self.delta.views[k] = Some(view);
+        let snap = &self.stack[self.top].snap;
+        let entry = &mut self.cache.entries[k][2 * view.bucket + (view.flip != 0) as usize];
+        count!(REFRESHES, 1);
+        timed!(DELTA, self.delta.compute(&entry.snap, snap));
+        count!(AUX_ROWS, self.delta.lists[k].n_aux_add + self.delta.lists[k].n_aux_sub);
+        count!(AUX_ROWS_REFRESH, self.delta.lists[k].n_aux_add + self.delta.lists[k].n_aux_sub);
+        count!(PSQT_ROWS_REFRESH, self.delta.lists[k].n_psqt_add + self.delta.lists[k].n_psqt_sub);
+        timed!(UPDATE, simd::update_in_place(&mut entry.acc, &self.delta.lists[k]));
+        entry.snap = *snap;
         let e = &mut self.stack[self.top];
-        e.acc[p.idx()] = entry.acc;
-        e.computed[p.idx()] = true;
+        e.acc[k] = entry.acc;
+        e.computed[k] = true;
     }
+}
+
+/// Active feature indices of `snap` for both perspectives, side to move first, as four
+/// sorted lines (`stm_psqt`, `ntm_psqt`, `stm_aux`, `ntm_aux`) for cross-checking against
+/// the trainer.
+pub fn debug_features(mut snap: Snapshot, stm: Color) -> String {
+    snap.ensure_threats();
+    let mut d = Delta::new();
+    let mut out = String::new();
+    let mut lines = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for (k, p) in [stm, stm.flip()].into_iter().enumerate() {
+        let (bucket, flip) = king_context(p, snap.kings[p.idx()]);
+        d.views = [Some(View { p, bucket, flip }), None];
+        d.compute(&Snapshot::EMPTY, &snap);
+        let l = &d.lists[0];
+        lines[k] = l.psqt_add[..l.n_psqt_add].to_vec();
+        lines[2 + k] = l.aux_add[..l.n_aux_add].to_vec();
+    }
+    for (name, v) in ["stm_psqt", "ntm_psqt", "stm_aux", "ntm_aux"].iter().zip(lines.iter_mut()) {
+        v.sort_unstable();
+        out.push_str(name);
+        for f in v.iter() {
+            out.push(' ');
+            out.push_str(&f.to_string());
+        }
+        out.push('\n');
+    }
+    out
 }
 
 impl Default for NnueState {
@@ -290,50 +1194,98 @@ fn king_context(p: Color, ksq: Square) -> (usize, u8) {
     (KING_BUCKET[rel as usize] as usize, if file_of(rel) > 3 { 7 } else { 0 })
 }
 
-/// Feature index of `pc` on `sq` from `p`'s perspective.
+/// Piece-square feature index of `pc` on `sq` from `p`'s perspective.
 #[inline(always)]
-fn feature(p: Color, bucket: usize, flip: u8, pc: Piece, sq: Square) -> usize {
+fn psqt_feature(p: Color, bucket: usize, flip: u8, pc: Piece, sq: Square) -> usize {
     let side = if pc.color() == p { 0 } else { 384 };
     768 * bucket + side + 64 * pc.piece_type().idx() + (relative_square(p, sq) ^ flip) as usize
 }
 
 #[cfg(target_feature = "avx2")]
 mod simd {
-    use super::{Accumulator, HL, NET, QA};
+    use super::{Accumulator, HL, Lists, NET, QA};
     use std::arch::x86_64::*;
 
     const CHUNK: usize = 16;
 
-    /// `dst = src + sum(adds) - sum(subs)` in one pass over the accumulator.
-    #[inline]
-    pub fn update(src: &Accumulator, dst: &mut Accumulator, adds: &[usize], subs: &[usize]) {
+    /// Pulls the piece-square rows of the delta towards the cache (the aux rows were
+    /// prefetched as they were enumerated).
+    #[inline(always)]
+    fn prefetch(d: &Lists) {
         unsafe {
-            for c in (0..HL).step_by(CHUNK) {
-                let mut v = _mm256_load_si256(src.v.as_ptr().add(c) as *const __m256i);
-                for &a in adds {
-                    v = _mm256_add_epi16(v, _mm256_load_si256(NET.ft_weights[a].v.as_ptr().add(c) as *const __m256i));
+            for &r in d.psqt_add[..d.n_psqt_add].iter().chain(d.psqt_sub[..d.n_psqt_sub].iter()) {
+                let row = NET.psqt_weights[r].v.as_ptr() as *const i8;
+                for line in (0..2 * HL).step_by(64) {
+                    _mm_prefetch(row.add(line), _MM_HINT_T0);
                 }
-                for &s in subs {
-                    v = _mm256_sub_epi16(v, _mm256_load_si256(NET.ft_weights[s].v.as_ptr().add(c) as *const __m256i));
-                }
-                _mm256_store_si256(dst.v.as_mut_ptr().add(c) as *mut __m256i, v);
             }
         }
     }
 
-    #[inline]
-    pub fn update_in_place(acc: &mut Accumulator, adds: &[usize], subs: &[usize]) {
+    /// Registers per tile: 16 ymm hold 256 accumulator lanes.
+    const TILE_REGS: usize = 16;
+    const TILE: usize = TILE_REGS * CHUNK;
+
+    /// Applies every row of `d` to the tile starting at lane `j`, reading it from `src`
+    /// and writing it to `dst`; the tile stays in registers throughout.
+    #[inline(always)]
+    unsafe fn apply_tile(src: *const i16, dst: *mut i16, j: usize, d: &Lists) {
         unsafe {
-            for c in (0..HL).step_by(CHUNK) {
-                let p = acc.v.as_mut_ptr().add(c) as *mut __m256i;
-                let mut v = _mm256_load_si256(p);
-                for &a in adds {
-                    v = _mm256_add_epi16(v, _mm256_load_si256(NET.ft_weights[a].v.as_ptr().add(c) as *const __m256i));
+            let mut acc: [__m256i; TILE_REGS] = [_mm256_setzero_si256(); TILE_REGS];
+            for k in 0..TILE_REGS {
+                acc[k] = _mm256_load_si256(src.add(j + k * CHUNK) as *const __m256i);
+            }
+            for &r in &d.psqt_add[..d.n_psqt_add] {
+                let row = NET.psqt_weights[r].v.as_ptr().add(j);
+                for k in 0..TILE_REGS {
+                    acc[k] = _mm256_add_epi16(acc[k], _mm256_load_si256(row.add(k * CHUNK) as *const __m256i));
                 }
-                for &s in subs {
-                    v = _mm256_sub_epi16(v, _mm256_load_si256(NET.ft_weights[s].v.as_ptr().add(c) as *const __m256i));
+            }
+            for &r in &d.psqt_sub[..d.n_psqt_sub] {
+                let row = NET.psqt_weights[r].v.as_ptr().add(j);
+                for k in 0..TILE_REGS {
+                    acc[k] = _mm256_sub_epi16(acc[k], _mm256_load_si256(row.add(k * CHUNK) as *const __m256i));
                 }
-                _mm256_store_si256(p, v);
+            }
+            for &r in &d.aux_add[..d.n_aux_add] {
+                let row = NET.aux_weights[r].as_ptr().add(j);
+                for k in 0..TILE_REGS {
+                    let w = _mm256_cvtepi8_epi16(_mm_loadu_si128(row.add(k * CHUNK) as *const __m128i));
+                    acc[k] = _mm256_add_epi16(acc[k], w);
+                }
+            }
+            for &r in &d.aux_sub[..d.n_aux_sub] {
+                let row = NET.aux_weights[r].as_ptr().add(j);
+                for k in 0..TILE_REGS {
+                    let w = _mm256_cvtepi8_epi16(_mm_loadu_si128(row.add(k * CHUNK) as *const __m128i));
+                    acc[k] = _mm256_sub_epi16(acc[k], w);
+                }
+            }
+            for k in 0..TILE_REGS {
+                _mm256_store_si256(dst.add(j + k * CHUNK) as *mut __m256i, acc[k]);
+            }
+        }
+    }
+
+    /// `dst = src + delta`.
+    #[inline]
+    pub fn update(src: &Accumulator, dst: &mut Accumulator, d: &Lists) {
+        prefetch(d);
+        unsafe {
+            for j in (0..HL).step_by(TILE) {
+                apply_tile(src.v.as_ptr(), dst.v.as_mut_ptr(), j, d);
+            }
+        }
+    }
+
+    /// `acc += delta`.
+    #[inline]
+    pub fn update_in_place(acc: &mut Accumulator, d: &Lists) {
+        prefetch(d);
+        unsafe {
+            let p = acc.v.as_mut_ptr();
+            for j in (0..HL).step_by(TILE) {
+                apply_tile(p, p, j, d);
             }
         }
     }
@@ -365,22 +1317,32 @@ mod simd {
 
 #[cfg(not(target_feature = "avx2"))]
 mod simd {
-    use super::{Accumulator, HL, NET, QA};
+    use super::{Accumulator, HL, Lists, NET, QA};
 
-    pub fn update(src: &Accumulator, dst: &mut Accumulator, adds: &[usize], subs: &[usize]) {
+    pub fn update(src: &Accumulator, dst: &mut Accumulator, d: &Lists) {
         dst.v = src.v;
-        update_in_place(dst, adds, subs);
+        update_in_place(dst, d);
     }
 
-    pub fn update_in_place(acc: &mut Accumulator, adds: &[usize], subs: &[usize]) {
-        for &a in adds {
+    pub fn update_in_place(acc: &mut Accumulator, d: &Lists) {
+        for &a in &d.psqt_add[..d.n_psqt_add] {
             for i in 0..HL {
-                acc.v[i] += NET.ft_weights[a].v[i];
+                acc.v[i] += NET.psqt_weights[a].v[i];
             }
         }
-        for &s in subs {
+        for &s in &d.psqt_sub[..d.n_psqt_sub] {
             for i in 0..HL {
-                acc.v[i] -= NET.ft_weights[s].v[i];
+                acc.v[i] -= NET.psqt_weights[s].v[i];
+            }
+        }
+        for &a in &d.aux_add[..d.n_aux_add] {
+            for i in 0..HL {
+                acc.v[i] += i16::from(NET.aux_weights[a][i]);
+            }
+        }
+        for &s in &d.aux_sub[..d.n_aux_sub] {
+            for i in 0..HL {
+                acc.v[i] -= i16::from(NET.aux_weights[s][i]);
             }
         }
     }
@@ -397,6 +1359,7 @@ mod simd {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::eval::evaluate;
     use crate::movegen::generate_legal;
     use crate::position::Position;
@@ -410,9 +1373,319 @@ mod tests {
         "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/4P1b1/1nP2N2/PP1PQPPP/R4RKR w - - 0 1",
     ];
 
+    /// The threat tables must match the trainer's: these are its attack-set sizes.
+    #[test]
+    fn threat_table_sizes() {
+        assert_eq!(KNIGHT_THREATS.count, 336);
+        assert_eq!(BISHOP_THREATS.count, 560);
+        assert_eq!(ROOK_THREATS.count, 896);
+        assert_eq!(QUEEN_THREATS.count, 1456);
+        assert_eq!(QUEEN_THREATS.offset + 10 * QUEEN_THREATS.count, THREATS_PER_SIDE as u32);
+        crate::init();
+        for sq in 0..64u8 {
+            assert_eq!(KNIGHT_THREATS.attacks[sq as usize], pseudo_attacks(PieceType::Knight, sq));
+            assert_eq!(BISHOP_THREATS.attacks[sq as usize], pseudo_attacks(PieceType::Bishop, sq));
+            assert_eq!(ROOK_THREATS.attacks[sq as usize], pseudo_attacks(PieceType::Rook, sq));
+            assert_eq!(QUEEN_THREATS.attacks[sq as usize], pseudo_attacks(PieceType::Queen, sq));
+        }
+    }
+
+    /// The lookup tables must agree with the arithmetic they replaced, for every attacker,
+    /// target and reachable pair of squares, in both directions (neither may decline where
+    /// the other produces a value).
+    #[test]
+    fn threat_lut_matches_reference() {
+        // The original arithmetic, verbatim apart from returning the index rather than
+        // asserting on it.
+        fn reference(attacker: Piece, s: usize, d: usize, target: Piece, p: Color) -> Option<usize> {
+            let tpt = target.piece_type().idx();
+            let tclass = tpt + if target.color() == p { 0 } else { 6 };
+            let pt = attacker.piece_type();
+            let idx = if pt == PieceType::Pawn {
+                let m = PAWN_TARGETS[tclass];
+                if m == NO_TARGET {
+                    return None;
+                }
+                let id = if d.abs_diff(s) == [9, 7][(d > s) as usize] { 0 } else { 1 };
+                let attack = (2 * (s % 8) + id) as i32 - 1;
+                m as usize * 84 + (s / 8 - 1) * 14 + attack as usize
+            } else {
+                let t = match pt {
+                    PieceType::Knight => &KNIGHT_THREATS,
+                    PieceType::Bishop => &BISHOP_THREATS,
+                    PieceType::Rook => &ROOK_THREATS,
+                    PieceType::Queen => &QUEEN_THREATS,
+                    _ => return None,
+                };
+                let m = t.targets[tclass];
+                if m == NO_TARGET || (d > s && tpt == pt.idx()) {
+                    return None;
+                }
+                let within = (t.attacks[s] & ((1u64 << d) - 1)).count_ones();
+                (t.offset + m as u32 * t.count + t.index[s] + within) as usize
+            };
+            let side = (attacker.color() != p) as usize;
+            Some(PP_FEATURES + THREATS_PER_SIDE * side + idx)
+        }
+
+        // Squares `attacker` on `s` can actually attack, in p-relative coordinates: own
+        // pawns capture upward, the opponent's downward.
+        fn reachable(ra: usize, s: usize) -> Bitboard {
+            let own = ra < 6;
+            match ra % 6 {
+                0 => {
+                    let bb = sq_bb(s as Square);
+                    if own {
+                        ((bb << 7) & !file_bb_of(7)) | ((bb << 9) & !file_bb_of(0))
+                    } else {
+                        ((bb >> 7) & !file_bb_of(0)) | ((bb >> 9) & !file_bb_of(7))
+                    }
+                }
+                1 => KNIGHT_THREATS.attacks[s],
+                2 => BISHOP_THREATS.attacks[s],
+                3 => ROOK_THREATS.attacks[s],
+                4 => QUEEN_THREATS.attacks[s],
+                _ => 0,
+            }
+        }
+
+        crate::init();
+        let mut checked = 0u64;
+        for a in 0..12u8 {
+            for t in 0..12u8 {
+                let (attacker, target) = (Piece(a), Piece(t));
+                for p in [Color::White, Color::Black] {
+                    let ra = relative_piece(attacker, p);
+                    for s in 0..64usize {
+                        let mut bb = reachable(ra, s);
+                        while bb != 0 {
+                            let d = pop_lsb(&mut bb) as usize;
+                            // Feed both the oriented squares, which is what the caller's
+                            // relative_square/flip step produces.
+                            let want = reference(attacker, s, d, target, p);
+                            let got = threat_index(ra, relative_piece(target, p), s, d);
+                            assert_eq!(
+                                want, got,
+                                "attacker {a} target {t} {s}->{d} perspective {p:?}: reference {want:?} lut {got:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100_000, "only {checked} comparisons");
+    }
+
+    /// Every feature index of a full position lies inside its table, and no delta from
+    /// the empty snapshot has duplicates (each feature is added once).
+    #[test]
+    fn features_in_range_and_unique() {
+        crate::init();
+        let mut d = Delta::new();
+        for fen in FENS {
+            let pos = Position::from_fen(fen).unwrap();
+            let mut snap = pos.nnue_snapshot();
+            snap.ensure_threats();
+            for p in [Color::White, Color::Black] {
+                let (bucket, flip) = king_context(p, snap.kings[p.idx()]);
+                d.views = [Some(View { p, bucket, flip }), None];
+                d.compute(&Snapshot::EMPTY, &snap);
+                let l = &d.lists[0];
+                assert_eq!(l.n_psqt_sub, 0);
+                assert_eq!(l.n_aux_sub, 0);
+                let mut aux: Vec<usize> = l.aux_add[..l.n_aux_add].to_vec();
+                assert!(aux.iter().all(|&f| f < AUX_FEATURES));
+                aux.sort_unstable();
+                aux.dedup();
+                assert_eq!(aux.len(), l.n_aux_add, "duplicate aux feature in {fen}");
+                assert!(l.psqt_add[..l.n_psqt_add].iter().all(|&f| f < PSQT_FEATURES));
+            }
+        }
+    }
+
+    /// Prints the cost of each stage of an update; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn timings() {
+        use std::time::Instant;
+        crate::init();
+        let fen = "r1bq1rk1/pp2bppp/2n1pn2/3p4/2PP4/2N1PN2/PP2BPPP/R2QKB1R w KQ - 0 8";
+        let mut pos = Position::from_fen(fen).unwrap();
+        let n = 200_000;
+
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..n {
+            let s = pos.nnue_snapshot();
+            acc = acc.wrapping_add(s.attackers);
+        }
+        println!("snapshot build:   {:6.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+
+        let t = Instant::now();
+        for _ in 0..n {
+            let mut s = pos.nnue_snapshot();
+            s.ensure_threats();
+            acc = acc.wrapping_add(s.threats[3]);
+        }
+        println!("build + threats:  {:6.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+
+        let mut old = pos.nnue_snapshot();
+        old.ensure_threats();
+        let m = crate::types::Move::make(crate::types::make_square(2, 3), crate::types::make_square(3, 4), crate::types::MoveType::Normal, PieceType::Pawn);
+        let gc = pos.gives_check(m);
+        pos.make_move(m, gc);
+        let mut new = pos.nnue_snapshot();
+        new.ensure_threats();
+        let mut d = Delta::new();
+        let views = [Some(View { p: Color::White, bucket: 0, flip: 0 }), Some(View { p: Color::Black, bucket: 0, flip: 0 })];
+        d.views = views;
+        let t = Instant::now();
+        for _ in 0..n {
+            d.compute(&old, &new);
+            acc = acc.wrapping_add(d.lists[0].n_aux_add as u64);
+        }
+        println!("delta (2 views):  {:6.1} ns  ({} psqt, {}+{} aux)", t.elapsed().as_nanos() as f64 / n as f64, d.lists[0].n_psqt_add + d.lists[0].n_psqt_sub, d.lists[0].n_aux_add, d.lists[0].n_aux_sub);
+        d.views = [views[0], None];
+        let t = Instant::now();
+        for _ in 0..n {
+            d.compute(&old, &new);
+            acc = acc.wrapping_add(d.lists[0].n_aux_add as u64);
+        }
+        println!("delta (1 view):   {:6.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+
+        let mut a = NET.ft_bias;
+        let t = Instant::now();
+        for _ in 0..n {
+            simd::update_in_place(&mut a, &d.lists[0]);
+            acc = acc.wrapping_add(a.v[7] as u64);
+        }
+        println!("acc update (warm):{:6.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+
+        // Touch every row once: the network is demand-paged out of the executable, so
+        // without this the first pattern measured pays all the page faults.
+        {
+            let mut warm = 0u64;
+            for r in 0..AUX_FEATURES {
+                warm = warm.wrapping_add(NET.aux_weights[r][0] as u64);
+            }
+            acc = acc.wrapping_add(warm);
+        }
+
+        // How much does the scattered layout of the aux table cost? Apply the same number
+        // of rows with different spacing: adjacent rows share pages and stream; rows spread
+        // across the whole 66 MB table miss the TLB and every cache level.
+        for (label, stride) in [("adjacent", 1usize), ("same page", 4), ("near (64)", 64), ("scattered", 977)] {
+            let mut l = Lists::new();
+            let t = Instant::now();
+            let mut row = 0usize;
+            let reps = n / 10;
+            for _ in 0..reps {
+                l.clear();
+                for _ in 0..20 {
+                    l.aux(row % AUX_FEATURES, true);
+                    row = row.wrapping_add(stride);
+                }
+                // start each batch somewhere new so nothing is already resident
+                row = row.wrapping_add(7919);
+                simd::update_in_place(&mut a, &l);
+                acc = acc.wrapping_add(a.v[7] as u64);
+            }
+            println!("acc update, 20 rows {label:10}: {:6.0} ns", t.elapsed().as_nanos() as f64 / reps as f64);
+        }
+
+        let t = Instant::now();
+        for _ in 0..n {
+            acc = acc.wrapping_add(simd::dot_screlu(&a, &NET.out_weights[3][..HL]) as u64);
+        }
+        println!("dot (one side):   {:6.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+
+        let t = Instant::now();
+        for _ in 0..n {
+            acc = acc.wrapping_add(evaluate(&mut pos) as u64);
+        }
+        println!("evaluate (cached):{:6.1} ns   [{acc}]", t.elapsed().as_nanos() as f64 / n as f64);
+    }
+
+    /// Every move's recorded threat changes must equal the difference of the attack sets.
+    #[test]
+    fn dirty_threats_match_snapshots() {
+        crate::init();
+        let mut rng = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut d1 = Delta::new();
+        let mut d2 = Delta::new();
+        let mut plies = 0;
+        for fen in FENS {
+            for _ in 0..20 {
+                let mut pos = Position::from_fen(fen).unwrap();
+                for _ in 0..200 {
+                    let mut list = MoveList::default();
+                    generate_legal(&pos, &mut list);
+                    if list.is_empty() || pos.rule50_count() > 90 {
+                        break;
+                    }
+                    let m = list.as_slice()[next() as usize % list.len()];
+                    let before = pos.fen();
+                    let uci = pos.move_to_uci(m);
+                    let gives_check = pos.gives_check(m);
+                    pos.make_move(m, gives_check);
+                    let st = pos.nnue_mut();
+                    let top = st.top;
+                    assert!(st.stack[top].dirty_valid, "no dirty list after {uci} in {before}");
+                    let (a, b) = st.stack.split_at_mut(top);
+                    let (old, new) = (&mut a[top - 1], &mut b[0]);
+                    old.snap.ensure_threats();
+                    new.snap.ensure_threats();
+                    for p in [Color::White, Color::Black] {
+                        let (bucket, flip) = king_context(p, new.snap.kings[p.idx()]);
+                        d1.views = [Some(View { p, bucket, flip }), None];
+                        d2.views = d1.views;
+                        d1.compute(&old.snap, &new.snap);
+                        d2.compute_from_dirty(&old.snap, &new.snap, &new.dirty);
+                        let net = |d: &Delta| {
+                            let l = &d.lists[0];
+                            let mut m = std::collections::BTreeMap::new();
+                            for &f in &l.aux_add[..l.n_aux_add] {
+                                *m.entry(f).or_insert(0i32) += 1;
+                            }
+                            for &f in &l.aux_sub[..l.n_aux_sub] {
+                                *m.entry(f).or_insert(0i32) -= 1;
+                            }
+                            m.retain(|_, v| *v != 0);
+                            m
+                        };
+                        let (n1, n2) = (net(&d1), net(&d2));
+                        if n1 != n2 {
+                            let only1: Vec<_> = n1.iter().filter(|(k, v)| n2.get(k) != Some(v)).collect();
+                            let only2: Vec<_> = n2.iter().filter(|(k, v)| n1.get(k) != Some(v)).collect();
+                            panic!(
+                                "mismatch after {uci} in {before} (perspective {:?})
+ snapshot-only {:?}
+ dirty-only {:?}
+ dirty list: {:?}",
+                                p,
+                                only1,
+                                only2,
+                                new.dirty.as_slice().iter().map(|d| (d.add(), d.attacker().0, d.from(), d.to(), d.target().0)).collect::<Vec<_>>()
+                            );
+                        }
+                    }
+                    plies += 1;
+                }
+            }
+        }
+        assert!(plies > 5000, "only {plies} plies");
+    }
+
     /// Random playouts with evaluations at random plies, after unmade side branches and
     /// after null moves; every incremental value must equal a fresh evaluation of the same
-    /// position, so this covers the dirty-piece replay, king-bucket refreshes and the cache.
+    /// position, so this covers the snapshot diffs, king-bucket refreshes and the cache.
     #[test]
     fn incremental_matches_fresh() {
         crate::init();

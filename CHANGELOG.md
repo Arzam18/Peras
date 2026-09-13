@@ -16,6 +16,35 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.0.0 (2026-09-13)
+[compare to v2.1.0](https://github.com/FirePlank/Peras/compare/v2.1.0...v3.0.0)
+
+**It is about 110 Elo better than v2.1.0.** The network now sees threats and pawn pairs, not just where the pieces stand.
+
+```
+Score of v3.0.0 vs v2.1.0: 70 - 19 - 78  [0.653] 167
+Elo: +109.6 +/- 38.7   (LOS 100%), 0 time losses
+SPRT bounds elo0=0 elo1=10, alpha=beta=0.05, 10s+0.1s, one thread
+```
+
+At a fixed 40k nodes, which measures the network's judgement without the speed it costs, the gain is +143.1 +/- 60.8 over 100 games.
+
+### Added
+- Threat inputs: for every piece, which piece it attacks and from where, as 59808 features per perspective. Pawn-pair inputs: every pair of pawns within one file of each other, as 4560 more. Both feature sets follow the design Stockfish introduced, and are credited in the readme
+- The threats a move changes are recorded by the board itself as the move is made, including the lines a moving piece opens and closes for the sliders behind it, so bringing an accumulator up to date needs no board scan
+- An `Acknowledgements` section in the readme crediting the Leela Chess Zero project, whose open training data the network is trained on, under the Open Database License
+
+### Changed
+- The network is `(768x10hm + threats + pawn pairs -> 1024)x2 -> 8`. Threat and pawn-pair weights are `i8` and the piece-square weights `i16`, all quantised by 255
+- Trained on six months of Leela data rather than two, over two cosine cycles totalling 62 billion positions. The second cycle was worth +74 Elo of judgement at fixed nodes but only +13.9 +/- 32.3 on the clock, so returns on further training of this network are diminishing
+- Accumulator rows are applied a register-resident tile at a time, which measured 4% faster than streaming whole rows
+- Threat feature indices come from lookup tables instead of a masked popcount per feature, which cut the cost of working out what a move changed by 30%
+- `UCI_Elo` tops out at 3500, the strength now measured for full play
+
+### Known issues
+- The network costs about a third of the previous nodes per second. It wins comfortably anyway, but the accumulator update is memory-bound on a 66 MB weight table and is where any further speed has to come from. Applying twenty scattered rows costs 1869 ns against 1451 ns for rows on one page, so roughly a quarter of that stage is layout. Large pages would remove the address-translation part of it but need a privilege the build cannot assume
+- `Skill Level` 0 to 19 were calibrated against the v2.0 evaluation and are not re-measured here, so the ratings they report are now conservative. Only the top of the range reflects v3.0.0
+
 ## v2.1.0 (2026-09-12)
 [compare to v2.0.1](https://github.com/FirePlank/Peras/compare/v2.0.1...v2.1.0)
 

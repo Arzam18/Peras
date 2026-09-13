@@ -19,7 +19,9 @@ const MAX_THREADS: usize = 256;
 /// landed near even. Levels never played directly are interpolated between their neighbours.
 ///
 /// Roughly +/- 100 Elo: the reference opponents are Stockfish's rating-limited modes, whose
-/// own scale is only approximately calibrated.
+/// own scale is only approximately calibrated. Levels 0 to 19 were measured against the
+/// v2.0 evaluation and have not been re-measured since v3.0.0 made the engine stronger, so
+/// the figures they report are conservative; only level 20 reflects current full strength.
 ///
 /// The curve is not smooth, so no formula reproduces it. Levels 12 to 16 span 20 Elo while
 /// 19 to 20 spans 275, because the weakening discards up to a pawn at random right through
@@ -28,7 +30,7 @@ const MAX_THREADS: usize = 256;
 const SKILL_ELO: [i32; 21] = [
     2301, 2364, 2428, 2491, 2555, 2624, 2692,
     2760, 2828, 2874, 2919, 2964, 3010, 3015,
-    3020, 3025, 3030, 3065, 3099, 3125, 3400,
+    3020, 3025, 3030, 3065, 3099, 3125, 3500,
 ];
 
 /// Range spanned by `UCI_Elo`: the weakest and strongest the engine actually plays.
@@ -379,6 +381,8 @@ impl Engine {
         println!("\n===========================");
         println!("Total time (ms) : {}", elapsed);
         println!("Nodes searched  : {}", total_nodes);
+        #[cfg(feature = "nnue-profile")]
+        println!("{}", crate::nnue::profile::report());
         println!("Nodes/second    : {}", total_nodes * 1000 / elapsed);
         self.pos = saved_pos;
         self.tt.clear();
@@ -454,7 +458,8 @@ pub fn run(args: Vec<String>) {
                 println!("option name Skill Level type spin default 20 min 0 max 20");
                 println!("option name UCI_LimitStrength type check default false");
                 println!("option name UCI_Elo type spin default {} min {} max {}", UCI_ELO_MIN, UCI_ELO_MIN, UCI_ELO_MAX);
-                let vars: Vec<String> = Variant::ALL.iter().map(|v| format!("var {}", v.name())).collect();
+                let mut vars: Vec<String> = Variant::ALL.iter().map(|v| format!("var {}", v.name())).collect();
+                vars.insert(1, "var chess".to_string());
                 println!("option name UCI_Variant type combo default standard {}", vars.join(" "));
                 println!("uciok");
             }
@@ -486,6 +491,10 @@ pub fn run(args: Vec<String>) {
                 engine.join_worker();
                 let v = crate::eval::evaluate(&mut engine.pos);
                 println!("info string static eval (side to move): {} ({})", v, format_score(v));
+            }
+            "nnuefeatures" => {
+                engine.join_worker();
+                print!("{}", crate::nnue::debug_features(engine.pos.nnue_snapshot(), engine.pos.side_to_move()));
             }
             "perft" => {
                 engine.join_worker();

@@ -27,14 +27,14 @@ go wtime 60000 btime 60000 winc 1000 binc 1000
 
 - **Search**: iterative deepening PVS with aspiration windows and MultiPV, a shared lock-free transposition table, and the full modern pruning set (razoring, reverse futility, null move, ProbCut, late move pruning and reductions, SEE and history pruning, singular and check extensions).
 - **Move ordering**: staged move picking driven by butterfly, capture, continuation, pawn, low-ply and countermove histories, with correction history on the static evaluation.
-- **Evaluation**: NNUE, a `(768x10hm -> 1024)x2 -> 8` network with SCReLU activation trained on Leela Chess Zero self-play data, with lazily updated accumulators, king-bucket refresh caching and AVX2 inference; plus insufficient-material and mop-up knowledge.
+- **Evaluation**: NNUE, a `(768x10hm + threats + pawn pairs -> 1024)x2 -> 8` network with SCReLU activation trained on Leela Chess Zero data, seeing which piece attacks which alongside where the pieces stand, with lazily updated accumulators, king-bucket refresh caching and AVX2 inference; plus insufficient-material and mop-up knowledge.
 - **Board**: magic bitboards, incremental Zobrist keys, static exchange evaluation, and full Chess960 support.
 - **Performance**: Lazy SMP up to 256 threads and time management that adapts to search stability.
 - **Play control**: `Skill Level` and `UCI_Elo` for weaker opponents, pondering, and `searchmoves` for restricted analysis.
 
 ## Strength
 
-About 3400 Elo on one thread at 10s+0.1s, measured against Stockfish's rating-limited modes. It scores 75% against the top of that ladder and 19% against full-strength Stockfish on the same hardware and time control.
+About 3500 Elo on one thread at 10s+0.1s, measured against Stockfish's rating-limited modes. [CHANGELOG.md](CHANGELOG.md) records what each release measured.
 
 ## Variants
 
@@ -77,7 +77,7 @@ cutechess-cli -variant crazyhouse -each proto=uci tc=10+0.1 \
 | `Ponder`            | false      | Allow `go ponder` and `ponderhit`              |
 | `Skill Level`       | 20         | Lower to weaken play                           |
 | `UCI_LimitStrength` | false      | Enables `UCI_Elo`                              |
-| `UCI_Elo`           | 2301       | Target rating, 2301 to 3400                    |
+| `UCI_Elo`           | 2301       | Target rating, 2301 to 3500                    |
 
 The console also takes `d` to print the board, `eval` for a static score, `perft N` and `divide N` for move counts, and `bench [depth]` for a fixed-depth benchmark. `peras bench` and `peras perft N [fen]` work as command-line arguments too.
 
@@ -90,6 +90,12 @@ cargo test --release --features variants # the above plus every variant
 
 Perft counts are checked against independent references, Chess960 and the variants included.
 
+## Acknowledgements
+
+Peras uses a neural network trained on data provided by the [Leela Chess Zero](https://lczero.org/) project, made available under the [Open Database License](https://opendatacommons.org/licenses/odbl/1-0/), with individual contents under the [Database Contents License](https://opendatacommons.org/licenses/dbcl/1-0/).
+
+The threat and pawn-pair input features follow [Stockfish](https://github.com/official-stockfish/Stockfish)'s design; both projects are GPL-3.0.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
@@ -98,4 +104,5 @@ GPL-3.0. See [LICENSE](LICENSE).
 
 - [Apeiron](https://github.com/FirePlank/infinite-chess-engine) - The infinite chess engine whose search Peras is adapted from
 - [Stockfish](https://github.com/official-stockfish/Stockfish) - The world's strongest open-source chess engine
+- [Leela Chess Zero](https://lczero.org/) - The project whose open training data the network is trained on
 - [Chess Programming Wiki](https://www.chessprogramming.org/) - Engine development resources
