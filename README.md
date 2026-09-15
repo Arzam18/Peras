@@ -1,10 +1,13 @@
 # Peras
 
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](LICENSE)
+[![Lichess Bullet rating](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FPerasBot&query=%24.perfs.bullet.rating&label=bullet&logo=lichess&color=black)](https://lichess.org/@/PerasBot)
+[![Lichess Blitz rating](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FPerasBot&query=%24.perfs.blitz.rating&label=blitz&logo=lichess&color=black)](https://lichess.org/@/PerasBot)
+[![Lichess Rapid rating](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FPerasBot&query=%24.perfs.rapid.rating&label=rapid&logo=lichess&color=black)](https://lichess.org/@/PerasBot)
+
 A strong UCI chess engine in Rust, for standard chess, Chess960 and five other variants.
 
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](LICENSE)
-
-Peras takes its search from [Apeiron](https://github.com/FirePlank/infinite-chess-engine), the infinite chess engine, and rebuilds it on bitboards for the 64-square board, with its own network evaluation. It has no dependencies and builds into a single binary.
+It has no dependencies and builds into a single binary. Feel free to challenge me on [Lichess](https://lichess.org/@/PerasBot)!
 
 ## Quick Start
 
