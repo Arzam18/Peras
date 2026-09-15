@@ -16,6 +16,26 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.2.1 (2026-09-15)
+[compare to v3.2.0](https://github.com/FirePlank/Peras/compare/v3.2.0...v3.2.1)
+
+**No change to play.** Reported evaluations are normalised so that +1.00 means a 50%
+chance of winning, the anchor Stockfish and Ethereal both report against.
+
+### Added
+- `UCI_ShowWDL` appends `wdl` win, draw and loss counts per mille, from the same fitted model
+- `Normalize`, on by default; switched off, scores are reported in the network's own units
+
+### Changed
+- Reported centipawns are `100 * v / a`, where `a` is the score this engine wins half its
+  games from: `357.2 - 97.3m`, for the 1/3/3/5/9 material count `m` over 58. Fitted over
+  1.5 million evaluation and result pairs from 20000 of this engine's own games across nine
+  material bands, which a line reproduces to within 7cp. The network's raw output was
+  previously reported unscaled, which read about three times Stockfish's figure for the
+  same position
+- Node counts at fixed depth are unchanged: the search works in the network's units
+  throughout, and only what is printed differs
+
 ## v3.2.0 (2026-09-15)
 [compare to v3.1.0](https://github.com/FirePlank/Peras/compare/v3.1.0...v3.2.0)
 

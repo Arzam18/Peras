@@ -785,6 +785,18 @@ impl Position {
         self.piece_count[Piece::make(c, pt).idx()] as i32
     }
 
+    /// Material on the board, weighted the usual 1/3/3/5/9 way. Used to calibrate the
+    /// reported score, since the same evaluation converts far more often with a full
+    /// board than in a sparse endgame.
+    #[inline]
+    pub fn material_count(&self) -> i32 {
+        let n = |pt| self.count_cp(Color::White, pt) + self.count_cp(Color::Black, pt);
+        n(PieceType::Pawn)
+            + 3 * (n(PieceType::Knight) + n(PieceType::Bishop))
+            + 5 * n(PieceType::Rook)
+            + 9 * n(PieceType::Queen)
+    }
+
     #[inline(always)]
     pub fn count_all(&self) -> i32 {
         popcount(self.pieces())

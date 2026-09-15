@@ -210,6 +210,10 @@ impl Engine {
                     self.apply_searcher_options();
                 }
             }
+            "normalize" => {
+                let on = value.eq_ignore_ascii_case("true");
+                crate::search::NORMALIZE_SCORE.store(on, std::sync::atomic::Ordering::Relaxed);
+            }
             "uci_chess960" => {
                 let on = value.eq_ignore_ascii_case("true");
                 if on {
@@ -242,7 +246,11 @@ impl Engine {
                     self.apply_searcher_options();
                 }
             }
-            "ponder" | "uci_showwdl" => {}
+            "uci_showwdl" => {
+                let on = value.eq_ignore_ascii_case("true");
+                crate::search::SHOW_WDL.store(on, std::sync::atomic::Ordering::Relaxed);
+            }
+            "ponder" => {}
             _ => println!("info string unknown option '{}'", name),
         }
     }
@@ -463,6 +471,8 @@ pub fn run(args: Vec<String>) {
                 println!("option name Move Overhead type spin default 10 min 0 max 5000");
                 println!("option name MultiPV type spin default 1 min 1 max 256");
                 println!("option name Contempt type spin default {} min -100 max 100", crate::search::params::DEFAULT_CONTEMPT);
+                println!("option name Normalize type check default true");
+                println!("option name UCI_ShowWDL type check default false");
                 println!("option name UCI_Chess960 type check default false");
                 println!("option name UCI_AnalyseMode type check default false");
                 println!("option name Ponder type check default false");
@@ -501,7 +511,7 @@ pub fn run(args: Vec<String>) {
             "eval" => {
                 engine.join_worker();
                 let v = crate::eval::evaluate(&mut engine.pos);
-                println!("info string static eval (side to move): {} ({})", v, format_score(v));
+                println!("info string static eval (side to move): {} ({})", v, format_score(v, &engine.pos));
             }
             "nnuefeatures" => {
                 engine.join_worker();

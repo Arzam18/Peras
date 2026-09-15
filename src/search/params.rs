@@ -135,6 +135,24 @@ pub const CORR_W_LASTMOVE: i32 = 18;
 // LMR correction adjustment: how much the correction-history delta can trim a reduction.
 pub const LMR_CORR_DIVISOR: i32 = 15185;
 
+// Win-rate model, used only to report scores: the chance of winning from an internal
+// score `v` is `1 / (1 + exp((a - v) / b))`, where `a` is the score that wins half the
+// time and `b` sets how quickly that changes. Both move with the material on the board,
+// because the same score converts far more often with a full board than in a sparse
+// endgame. Fitted over 1.5M eval/result pairs from 20000 of this engine's own games,
+// binned into nine material bands: `a` runs from 320 in the sparsest to 230 with
+// everything on, and a line in `m` reproduces all nine to within 7cp.
+
+// Scaled by 1000 to keep this integer. `m` is the material count over 58, clamped to the
+// range the fit covers.
+pub const WDL_A_INTERCEPT: i32 = 357_200;
+pub const WDL_A_SLOPE: i32 = -97_300;
+pub const WDL_B_INTERCEPT: i32 = 72_300;
+pub const WDL_B_SLOPE: i32 = 48_600;
+pub const WDL_MATERIAL_ANCHOR: i32 = 58;
+pub const WDL_MATERIAL_MIN: i32 = 17;
+pub const WDL_MATERIAL_MAX: i32 = 78;
+
 // Table sizes
 pub const LOW_PLY_HISTORY_SIZE: usize = 4;
 pub const PAWN_HISTORY_SIZE: usize = 2048;

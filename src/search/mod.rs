@@ -272,14 +272,50 @@ fn history_bonus(depth: i32) -> i32 {
     (HISTORY_BONUS_BASE * depth - HISTORY_BONUS_SUB).min(HISTORY_BONUS_CAP)
 }
 
-pub fn format_score(v: Value) -> String {
-    if is_win(v) {
+/// Whether reported scores are normalised. Off reports the network's own units, which is
+/// what the search works in.
+pub static NORMALIZE_SCORE: AtomicBool = AtomicBool::new(true);
+/// Whether to append `wdl` to the reported score.
+pub static SHOW_WDL: AtomicBool = AtomicBool::new(false);
+
+/// The win-rate model's parameters for this position, both times 1000.
+fn win_rate_params(pos: &Position) -> (i32, i32) {
+    let m = pos.material_count().clamp(WDL_MATERIAL_MIN, WDL_MATERIAL_MAX);
+    let a = WDL_A_INTERCEPT + WDL_A_SLOPE * m / WDL_MATERIAL_ANCHOR;
+    let b = WDL_B_INTERCEPT + WDL_B_SLOPE * m / WDL_MATERIAL_ANCHOR;
+    (a.max(1000), b.max(1000))
+}
+
+/// Chance in a thousand of winning from `v`, per the fitted model.
+fn win_permille(v: Value, a: i32, b: i32) -> i32 {
+    let x = (a as f64 - 1000.0 * v as f64) / b as f64;
+    (1000.0 / (1.0 + x.exp())).round() as i32
+}
+
+pub fn format_score(v: Value, pos: &Position) -> String {
+    let score = if is_win(v) {
         format!("mate {}", (VALUE_MATE - v + 1) / 2)
     } else if is_loss(v) {
         format!("mate -{}", (VALUE_MATE + v + 1) / 2)
+    } else if NORMALIZE_SCORE.load(Ordering::Relaxed) {
+        // A shown +1.00 is the score this engine wins half the time from.
+        let (a, _) = win_rate_params(pos);
+        format!("cp {}", 100_000 * v / a)
     } else {
         format!("cp {}", v)
+    };
+    if !SHOW_WDL.load(Ordering::Relaxed) {
+        return score;
     }
+    let (a, b) = win_rate_params(pos);
+    let (w, l) = if is_win(v) {
+        (1000, 0)
+    } else if is_loss(v) {
+        (0, 1000)
+    } else {
+        (win_permille(v, a, b), win_permille(-v, a, b))
+    };
+    format!("{} wdl {} {} {}", score, w, 1000 - w - l, l)
 }
 
 impl Searcher {
@@ -846,7 +882,7 @@ impl Searcher {
                 depth,
                 self.seldepth.max(depth as usize),
                 i + 1,
-                format_score(rm.score),
+                format_score(rm.score, pos),
                 nodes,
                 nps,
                 hashfull,
