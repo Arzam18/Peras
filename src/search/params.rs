@@ -132,6 +132,9 @@ pub const CORR_W_MINOR: i32 = 23;
 pub const CORR_W_MATERIAL: i32 = 17;
 pub const CORR_W_LASTMOVE: i32 = 18;
 
+// LMR correction adjustment: how much the correction-history delta can trim a reduction.
+pub const LMR_CORR_DIVISOR: i32 = 15185;
+
 // Table sizes
 pub const LOW_PLY_HISTORY_SIZE: usize = 4;
 pub const PAWN_HISTORY_SIZE: usize = 2048;

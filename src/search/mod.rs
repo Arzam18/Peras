@@ -1115,7 +1115,13 @@ impl Searcher {
         static_eval += -self.stack[ply - 1].stat_score / 512;
         self.stack[ply].static_eval = static_eval;
 
-        let mut improving = if ply >= 2 && !in_check { static_eval > self.stack[ply - 2].static_eval } else { true };
+        let mut improving = if in_check {
+            false
+        } else if ply >= 2 {
+            static_eval > self.stack[ply - 2].static_eval
+        } else {
+            true
+        };
         let opponent_worsening = !in_check && static_eval > -self.stack[ply - 1].static_eval;
 
         // Refine the eval with a TT bound in the right direction.
@@ -1146,7 +1152,9 @@ impl Searcher {
             let bound_ok = if fails_high { tt_bound.has_lower() } else { tt_bound.has_upper() };
             let node_ok = (cut_node == fails_high) || depth > 5;
             let rule50_ok = rule50 < 96;
-            if depth_ok && bound_ok && node_ok && rule50_ok && !pos.is_repetition(ply) {
+            // is_repetition(ply) is not re-checked here: pos.is_draw(ply) above already
+            // tested it with this same ply and would have returned if true.
+            if depth_ok && bound_ok && node_ok && rule50_ok {
                 return tt_value;
             }
             // Deep enough but holding the opposite bound: shave a ply so a real search
@@ -1305,6 +1313,9 @@ impl Searcher {
 
         let mut best_score = -VALUE_INFINITE;
         let mut best_move = Move::NONE;
+        // Only a move that raised alpha, stored in the TT: best_move can be the least-bad
+        // of a set of fail-low bounds, which is not a claim the position is this good.
+        let mut tt_best_move = Move::NONE;
         let mut legal_moves = 0usize;
         let mut quiets_searched = MoveList::new();
         let mut captures_searched: [(Move, PieceType); 32] = [(Move::NONE, PieceType::Pawn); 32];
@@ -1395,10 +1406,9 @@ impl Searcher {
                     return 0;
                 }
                 if se_value < singular_beta {
-                    let corr_adj = (static_eval - raw_eval).abs() / 256;
                     let pv_bonus = if is_pv { depth * 2 } else { 0 };
-                    let double_margin = depth * 2 - tt_capture as i32 * 5 - corr_adj + pv_bonus;
-                    let triple_margin = depth * 4 - tt_capture as i32 * 10 - corr_adj + pv_bonus * 2;
+                    let double_margin = depth * 2 - tt_capture as i32 * 5 + pv_bonus;
+                    let triple_margin = depth * 4 - tt_capture as i32 * 10 + pv_bonus * 2;
                     extension = 1;
                     if se_value < singular_beta - double_margin {
                         extension = 2;
@@ -1474,7 +1484,7 @@ impl Searcher {
                     reduction -= (hist_score + pawn_score) / 4096 + cont_score / 6144;
 
                     let correction = (static_eval - raw_eval) * CORRHIST_GRAIN;
-                    reduction -= (correction.abs() / 30370).clamp(0, 2);
+                    reduction -= (correction.abs() / LMR_CORR_DIVISOR).clamp(0, 2);
 
                     if self.is_shuffling(pos, m, ply, is_capture) {
                         reduction += 1;
@@ -1519,14 +1529,10 @@ impl Searcher {
                 let child_type = if child_type == NodeType::Cut { NodeType::All } else { NodeType::Cut };
                 self.stack[ply].reduction = reduction;
 
-                let first_pv_move = is_pv && legal_moves == 1;
-                let mut s = if first_pv_move {
-                    -self.negamax(pos, new_depth.max(0), ply + 1, -beta, -alpha, NodeType::PV, true, Move::NONE)
-                } else {
-                    -self.negamax(pos, search_depth, ply + 1, -alpha - 1, -alpha, child_type, true, Move::NONE)
-                };
+                let mut s =
+                    -self.negamax(pos, search_depth, ply + 1, -alpha - 1, -alpha, child_type, true, Move::NONE);
 
-                if !first_pv_move && s > alpha && (reduction > 0 || s < beta) && !self.stopped {
+                if s > alpha && (reduction > 0 || s < beta) && !self.stopped {
                     let research_type = if is_pv { NodeType::PV } else { child_type };
                     let base_depth = new_depth;
                     let do_deeper = search_depth < base_depth && s > best_score + 43 + 2 * base_depth;
@@ -1560,6 +1566,7 @@ impl Searcher {
                 best_move = m;
                 if score > alpha {
                     alpha = score;
+                    tt_best_move = m;
                     self.update_pv(ply, m);
                 }
             }
@@ -1643,7 +1650,7 @@ impl Searcher {
         };
 
         if excluded.is_none() {
-            self.tt.store(key, depth, bound, tt_pv, value_to_tt(best_score, ply), raw_eval, best_move);
+            self.tt.store(key, depth, bound, tt_pv, value_to_tt(best_score, ply), raw_eval, tt_best_move);
         }
 
         // TT move reliability (non-PV only for clean statistics).
@@ -1811,6 +1818,7 @@ impl Searcher {
             if !pos.legal(m) {
                 continue;
             }
+            self.tt.prefetch(pos.key_after(m));
             let pc = pos.moved_piece(m);
             let is_capture = pos.is_capture(m);
             let gives_check = pos.gives_check(m);

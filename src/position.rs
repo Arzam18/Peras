@@ -1570,6 +1570,10 @@ impl Position {
         let pc = self.piece_on(from);
         let captured = self.piece_on(to);
         let mut k = self.key() ^ ZOBRIST.side;
+        // Every move clears the ep square, so the child's key never carries this term.
+        if self.state().ep_square != SQ_NONE {
+            k ^= ZOBRIST.en_passant[file_of(self.state().ep_square) as usize];
+        }
         if captured.is_some() {
             k ^= psq_key(captured, to);
         }

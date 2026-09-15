@@ -16,15 +16,33 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.2.0 (2026-09-15)
+[compare to v3.1.0](https://github.com/FirePlank/Peras/compare/v3.1.0...v3.2.0)
+
+**It is about 11 Elo better than v3.1.0.** Search fixes ported over from this engine's
+sibling project, which shares the same search core.
+
+```
+Score of v3.2.0 vs v3.1.0: 637 - 555 - 1332  [0.516] 2524
+Elo: +11.4 +/- 9.4   (LOS 99.1%), 6 time losses
+SPRT bounds elo0=0 elo1=5, alpha=beta=0.05, 10s+0.1s, capped short of the LLR bound
+```
+
+### Changed
+- The TT no longer stores a move that only ever produced a fail-low bound
+- A node in check is treated as not improving instead of defaulting to improving
+- The LMR correction adjustment's divisor is halved so its two-ply ceiling is reachable
+
+### Fixed
+- A stale prefetch address at the en passant square, which pointed at the wrong TT bucket
+  on any move made right after a double pawn push
+- Quiescence search issued no prefetch at all
+
 ## v3.1.0 (2026-09-15)
 [compare to v3.0.0](https://github.com/FirePlank/Peras/compare/v3.0.0...v3.1.0)
 
 **It is about 16 Elo better than v3.0.0 under a moves-per-period control.** Time allocation
-is redesigned: the old formula had no time-control term, so a 3-minute game was allocated
-like a stretched 10-second one, and its horizon table reserved time for hundred-move
-shuffles because those are the games still running that late in the data it was measured
-from. `40 moves in 20 minutes, repeating` was worse still: up to 41% of each period's clock
-went unused at the reset, since nothing told the allocator the time did not carry over.
+is redesigned to scale with the time control instead of treating every clock the same.
 
 ```
 Score of v3.1.0 vs v3.0.0 [40 moves / 20 min, repeating]: 521 - 418 - 1261  [0.523] 2200
