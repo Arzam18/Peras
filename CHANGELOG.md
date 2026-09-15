@@ -16,6 +16,22 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.3.0 (2026-09-15)
+[compare to v3.2.1](https://github.com/FirePlank/Peras/compare/v3.2.1...v3.3.0)
+
+**It is about 4 Elo better than v3.2.1.** Contempt is gone.
+
+```
+Score of keeping contempt vs removing it: 523 - 552 - 1440  [0.494] 2515
+Elo: -4.0 +/- 8.9 to keep it, so +4.0 to remove it   (LOS 18.7%), 0 time losses
+SPRT bounds elo0=-3 elo1=1, alpha=beta=0.05, 10s+0.1s
+```
+
+### Removed
+- The `Contempt` option, and the draw-score offset behind it that scored a draw 15
+  centipawns against whoever faced one
+- `UCI_AnalyseMode`, whose only effect was to switch that offset off
+
 ## v3.2.1 (2026-09-15)
 [compare to v3.2.0](https://github.com/FirePlank/Peras/compare/v3.2.0...v3.2.1)
 

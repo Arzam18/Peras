@@ -158,9 +158,6 @@ pub const LOW_PLY_HISTORY_SIZE: usize = 4;
 pub const PAWN_HISTORY_SIZE: usize = 2048;
 pub const PAWN_HISTORY_MASK: u64 = (PAWN_HISTORY_SIZE - 1) as u64;
 
-/// Draw aversion in centipawns during play (analysis uses 0).
-pub const DEFAULT_CONTEMPT: Value = 15;
-
 /// Standard depth-and-move-count reduction: 1 + ln(m) * ln(d) / divisor.
 pub fn lmr_reduction(depth: i32, moves: usize) -> i32 {
     if depth <= 0 || moves == 0 {

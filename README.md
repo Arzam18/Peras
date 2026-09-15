@@ -71,10 +71,10 @@ cutechess-cli -variant crazyhouse -each proto=uci tc=10+0.1 \
 | `Threads`           | 1          | Search threads                                 |
 | `Move Overhead`     | 10         | Milliseconds reserved per move for latency     |
 | `MultiPV`           | 1          | Principal variations to report                 |
-| `Contempt`          | 15         | Draw aversion in centipawns                    |
+| `Normalize`         | true       | Report scores so +1.00 is a 50% win chance     |
+| `UCI_ShowWDL`       | false      | Append win, draw and loss counts per mille     |
 | `UCI_Chess960`      | false      | Chess960 castling rules and notation           |
 | `UCI_Variant`       | `standard` | Variant to play                                |
-| `UCI_AnalyseMode`   | false      | Neutral analysis, without contempt             |
 | `Ponder`            | false      | Allow `go ponder` and `ponderhit`              |
 | `Skill Level`       | 20         | Lower to weaken play                           |
 | `UCI_LimitStrength` | false      | Enables `UCI_Elo`                              |

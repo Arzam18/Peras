@@ -183,7 +183,6 @@ pub struct Searcher {
     pub tm: TimeManager,
     pub silent: bool,
     pub multipv: usize,
-    pub contempt: Value,
     pub chess960: bool,
     /// Skill level 0..=20; below 20 the final move is picked from several lines.
     pub skill_level: i32,
@@ -219,13 +218,6 @@ pub struct Searcher {
 #[inline(always)]
 fn value_draw(nodes: u64) -> Value {
     VALUE_DRAW - 1 + (nodes & 2) as Value
-}
-
-/// Scores are side-to-move relative and the root side moves at even ply, so the
-/// sign flips with parity to make a draw cost us either way.
-#[inline(always)]
-fn draw_contempt(contempt: Value, ply: usize) -> Value {
-    if ply.is_multiple_of(2) { -contempt } else { contempt }
 }
 
 /// Score of a node with no legal moves.
@@ -300,7 +292,8 @@ pub fn format_score(v: Value, pos: &Position) -> String {
     } else if NORMALIZE_SCORE.load(Ordering::Relaxed) {
         // A shown +1.00 is the score this engine wins half the time from.
         let (a, _) = win_rate_params(pos);
-        format!("cp {}", 100_000 * v / a)
+        // In i64: a winning score approaches 31871, and 100_000 times that overflows i32.
+        format!("cp {}", 100_000i64 * v as i64 / a as i64)
     } else {
         format!("cp {}", v)
     };
@@ -337,7 +330,6 @@ impl Searcher {
             tm: TimeManager::untimed(),
             silent: false,
             multipv: 1,
-            contempt: DEFAULT_CONTEMPT,
             chess960: false,
             skill_level: 20,
             ponderhit: Arc::new(AtomicBool::new(false)),
@@ -1073,7 +1065,7 @@ impl Searcher {
 
         // A reversible move that repeats a position is always available as a draw.
         if alpha < VALUE_DRAW && pos.upcoming_repetition(ply) {
-            let draw_val = value_draw(self.nodes) + draw_contempt(self.contempt, ply);
+            let draw_val = value_draw(self.nodes);
             if draw_val >= beta {
                 return draw_val;
             }
@@ -1101,7 +1093,7 @@ impl Searcher {
         }
 
         if pos.is_draw(ply) {
-            return value_draw(self.nodes) + draw_contempt(self.contempt, ply);
+            return value_draw(self.nodes);
         }
         if let Some(v) = variant_terminal(pos, ply) {
             return v;
@@ -1737,7 +1729,7 @@ impl Searcher {
         }
 
         if alpha < VALUE_DRAW && pos.upcoming_repetition(ply) {
-            let draw_val = value_draw(self.nodes) + draw_contempt(self.contempt, ply);
+            let draw_val = value_draw(self.nodes);
             if draw_val >= beta {
                 return draw_val;
             }
@@ -1752,7 +1744,7 @@ impl Searcher {
         let in_check = pos.in_check();
 
         if pos.is_draw(ply) {
-            return VALUE_DRAW + draw_contempt(self.contempt, ply);
+            return VALUE_DRAW;
         }
         if let Some(v) = variant_terminal(pos, ply) {
             return v;
@@ -2057,5 +2049,45 @@ pub fn think(pos: &Position, limits: &Limits, tm: TimeManager, searchers: &mut [
         score: winner.prev_score,
         depth: winner.completed_depth,
         nodes: total_nodes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::position::Position;
+
+    /// A reported score must keep the sign of the score it came from, over the whole
+    /// range a non-mate evaluation can take: a won position must never read as a lost
+    /// one. Scores run to 31871, so the scaling has to be done wider than 32 bits.
+    #[test]
+    fn reported_score_keeps_its_sign() {
+        let mut pos = Position::startpos();
+        let _ = crate::eval::evaluate(&mut pos);
+        for v in [1, 100, 1000, 21474, 21475, 25000, 31000, VALUE_EVAL_MAX] {
+            for signed in [v, -v] {
+                let s = format_score(signed, &pos);
+                let cp: i32 = s.strip_prefix("cp ").expect("not a mate score").parse().unwrap();
+                // Scores too small to survive the division report zero, which is fine;
+                // reporting the opposite sign is what must never happen.
+                assert_ne!(cp.signum(), -signed.signum(), "{signed} reported as {s}");
+                assert!(cp.abs() <= signed.abs(), "{signed} reported as {s}, larger than itself");
+            }
+        }
+    }
+
+    /// Reporting must not reorder scores: a better position cannot read as a worse one.
+    #[test]
+    fn reported_score_is_monotonic() {
+        let mut pos = Position::startpos();
+        let _ = crate::eval::evaluate(&mut pos);
+        let mut prev = i32::MIN;
+        let mut v = -VALUE_EVAL_MAX;
+        while v <= VALUE_EVAL_MAX {
+            let cp: i32 = format_score(v, &pos).strip_prefix("cp ").unwrap().parse().unwrap();
+            assert!(cp >= prev, "score {v} reported {cp}, below the previous {prev}");
+            prev = cp;
+            v += 97;
+        }
     }
 }

@@ -42,9 +42,7 @@ struct Options {
     threads: usize,
     move_overhead: u64,
     multipv: usize,
-    contempt: Value,
     chess960: bool,
-    analyse_mode: bool,
     skill_level: i32,
     limit_strength: bool,
     elo: i32,
@@ -77,9 +75,7 @@ impl Engine {
                 threads: 1,
                 move_overhead: 10,
                 multipv: 1,
-                contempt: crate::search::params::DEFAULT_CONTEMPT,
                 chess960: false,
-                analyse_mode: false,
                 skill_level: 20,
                 limit_strength: false,
                 elo: UCI_ELO_MIN,
@@ -204,12 +200,6 @@ impl Engine {
                     self.apply_searcher_options();
                 }
             }
-            "contempt" => {
-                if let Ok(c) = value.parse::<i32>() {
-                    self.options.contempt = c.clamp(-100, 100);
-                    self.apply_searcher_options();
-                }
-            }
             "normalize" => {
                 let on = value.eq_ignore_ascii_case("true");
                 crate::search::NORMALIZE_SCORE.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -226,10 +216,6 @@ impl Engine {
                 Some(v) => self.set_variant(v),
                 None => println!("info string unknown variant '{}'", value),
             },
-            "uci_analysemode" => {
-                self.options.analyse_mode = value.eq_ignore_ascii_case("true");
-                self.apply_searcher_options();
-            }
             "skill level" => {
                 if let Ok(l) = value.parse::<i32>() {
                     self.options.skill_level = l.clamp(0, 20);
@@ -258,12 +244,10 @@ impl Engine {
     fn apply_searcher_options(&mut self) {
         self.join_worker();
         let skill = self.effective_skill();
-        let contempt = if self.options.analyse_mode { 0 } else { self.options.contempt };
         let ponderhit = Arc::clone(&self.ponderhit);
         if let Some(s) = self.searchers.as_mut() {
             for sr in s.iter_mut() {
                 sr.multipv = self.options.multipv;
-                sr.contempt = contempt;
                 sr.chess960 = self.options.chess960;
                 sr.skill_level = skill;
                 sr.ponderhit = Arc::clone(&ponderhit);
@@ -470,11 +454,9 @@ pub fn run(args: Vec<String>) {
                 println!("option name Threads type spin default 1 min 1 max {}", MAX_THREADS);
                 println!("option name Move Overhead type spin default 10 min 0 max 5000");
                 println!("option name MultiPV type spin default 1 min 1 max 256");
-                println!("option name Contempt type spin default {} min -100 max 100", crate::search::params::DEFAULT_CONTEMPT);
                 println!("option name Normalize type check default true");
                 println!("option name UCI_ShowWDL type check default false");
                 println!("option name UCI_Chess960 type check default false");
-                println!("option name UCI_AnalyseMode type check default false");
                 println!("option name Ponder type check default false");
                 println!("option name Skill Level type spin default 20 min 0 max 20");
                 println!("option name UCI_LimitStrength type check default false");
