@@ -1,0 +1,107 @@
+name: Release binaries
+
+# Builds the release binaries and attaches them to the release for a tag. Run it from the
+# Actions tab (or it fires when a v* tag is pushed). The network is not in this repository,
+# so each job downloads it from Peras-networks first.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and upload to (e.g. v3.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NET_URL: https://github.com/FirePlank/Peras-networks/releases/download/peras-v3/peras-v3.nnue
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86-64-avx2
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cpu: x86-64-v3
+          - name: windows-x86-64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cpu: x86-64-v2
+          - name: linux-x86-64-avx2
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v3
+          - name: linux-x86-64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v2
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            cpu: apple-m1
+          # macos-13 (the last Intel-hosted runner) is retired; cross-compile this
+          # slice from the arm64 runner instead, since the Xcode toolchain it ships
+          # carries both SDKs.
+          - name: macos-x86-64-avx2
+            os: macos-latest
+            target: x86_64-apple-darwin
+            cpu: x86-64-v3
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Fetch the network
+        shell: bash
+        run: |
+          mkdir -p nets
+          curl -sSfL "$NET_URL" -o nets/peras.nnue
+          ls -l nets/peras.nnue
+
+      - name: Build
+        shell: bash
+        # RUSTFLAGS overrides the target-cpu in .cargo/config.toml, which is x86-only.
+        run: RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}" cargo build --release --target ${{ matrix.target }}
+
+      - name: Test and bench
+        shell: bash
+        run: |
+          RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}" cargo test --release --target ${{ matrix.target }}
+          BIN=target/${{ matrix.target }}/release/peras
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          "$BIN" bench 12
+
+      - name: Package
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          DIR="peras-${TAG#v}-${{ matrix.name }}"
+          mkdir "$DIR"
+          BIN=target/${{ matrix.target }}/release/peras
+          if [ -f "$BIN.exe" ]; then cp "$BIN.exe" "$DIR/peras.exe"; else cp "$BIN" "$DIR/peras"; fi
+          cp README.md CHANGELOG.md LICENSE "$DIR/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "$DIR.zip" "$DIR" > /dev/null && echo "ASSET=$DIR.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$DIR.tar.gz" "$DIR" && echo "ASSET=$DIR.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "$ASSET" --clobber
