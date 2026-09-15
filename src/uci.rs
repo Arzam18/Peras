@@ -61,6 +61,8 @@ struct Engine {
     searchers: Option<Vec<Box<Searcher>>>,
     #[allow(clippy::vec_box)]
     worker: Option<JoinHandle<(Vec<Box<Searcher>>, SearchOutcome)>>,
+    /// Last search score, fed to the time manager's shuffle discount.
+    last_score: Option<crate::types::Value>,
 }
 
 impl Engine {
@@ -88,6 +90,7 @@ impl Engine {
             ponderhit,
             searchers: None,
             worker: None,
+            last_score: None,
         };
         e.rebuild_searchers();
         e
@@ -125,7 +128,10 @@ impl Engine {
     fn join_worker(&mut self) {
         if let Some(h) = self.worker.take() {
             match h.join() {
-                Ok((searchers, _)) => self.searchers = Some(searchers),
+                Ok((searchers, outcome)) => {
+                    self.searchers = Some(searchers);
+                    self.last_score = Some(outcome.score);
+                }
                 Err(_) => {
                     eprintln!("info string search thread panicked; rebuilding searchers");
                     self.searchers = None;
@@ -330,7 +336,12 @@ impl Engine {
         }
         self.ponderhit.store(false, Ordering::Relaxed);
 
-        let tm = TimeManager::init(&limits, self.pos.side_to_move(), self.pos.game_ply(), self.options.move_overhead);
+        let sit = crate::search::timeman::Situation {
+            ply: self.pos.game_ply(),
+            rule50: self.pos.rule50_count(),
+            last_score: self.last_score,
+        };
+        let tm = TimeManager::init(&limits, self.pos.side_to_move(), sit, self.options.move_overhead);
         let pos = self.pos.clone();
         let mut searchers = self.searchers.take().expect("searchers available");
         let stop = Arc::clone(&self.stop);

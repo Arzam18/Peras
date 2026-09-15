@@ -16,6 +16,38 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.1.0 (2026-09-15)
+[compare to v3.0.0](https://github.com/FirePlank/Peras/compare/v3.0.0...v3.1.0)
+
+**It is about 16 Elo better than v3.0.0 under a moves-per-period control.** Time allocation
+is redesigned: the old formula had no time-control term, so a 3-minute game was allocated
+like a stretched 10-second one, and its horizon table reserved time for hundred-move
+shuffles because those are the games still running that late in the data it was measured
+from. `40 moves in 20 minutes, repeating` was worse still: up to 41% of each period's clock
+went unused at the reset, since nothing told the allocator the time did not carry over.
+
+```
+Score of v3.1.0 vs v3.0.0 [40 moves / 20 min, repeating]: 521 - 418 - 1261  [0.523] 2200
+Elo: +16.3 +/- 9.5   (LOS 100%), 0 time losses
+SPRT bounds elo0=0 elo1=5, alpha=beta=0.05
+```
+
+At 10s+0.1s, where the old formula's lack of a time-control term happened not to matter,
+the two are equal: +/-9.9 Elo over 2212 games, 0 time losses.
+
+### Changed
+- This move's share of the clock now rises with the absolute time available rather than
+  being scale-invariant, and is weighted toward the middlegame by how likely the game is
+  still to be running at each future move, fitted to the games measured for the previous
+  horizon table
+- A move repeated with nothing captured or pushed for a while discounts its own share,
+  gated on the position being close so a side pushing for a fifty-move breakthrough still
+  gets full time
+- Behind on the clock now spends less; ahead does not spend more
+- A moves-per-period control amortises the budget over that period's own moves alone
+  rather than treating the reset as if the clock carried on, and the last move before a
+  reset runs the remaining budget down instead of banking it
+
 ## v3.0.0 (2026-09-13)
 [compare to v2.1.0](https://github.com/FirePlank/Peras/compare/v2.1.0...v3.0.0)
 
