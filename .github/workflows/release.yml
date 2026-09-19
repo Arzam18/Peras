@@ -109,7 +109,22 @@ jobs:
           # A tag push starts this before any release exists, and uploading to a missing
           # release fails. All six jobs reach here at once, so whichever loses the race to
           # create it carries on rather than failing.
+          #
+          # The body below is the part that never changes between releases. The one-line
+          # summary above it is written by hand afterwards, with `gh release edit`.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --notes "Binaries for $TAG." || true
+            cat > notes.md <<'NOTES'
+          ## Which binary
+
+          The network is compiled into every binary, so each archive is self-contained.
+
+          | Archive | For |
+          | ------- | --- |
+          | `windows-x86-64-avx2`, `linux-x86-64-avx2` | Haswell/Zen 1 and newer. Pick this unless your CPU predates 2013 |
+          | `windows-x86-64`, `linux-x86-64` | Any x86-64 with SSE4.2. About a quarter slower |
+          | `macos-arm64` | Apple Silicon |
+          | `macos-x86-64-avx2` | Intel Macs |
+          NOTES
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md || true
           fi
           gh release upload "$TAG" "$ASSET" --clobber
