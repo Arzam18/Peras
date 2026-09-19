@@ -12,7 +12,7 @@ It has no dependencies and builds into a single binary. Feel free to challenge m
 ## Quick Start
 
 ```bash
-curl -sL https://github.com/FirePlank/Peras-networks/releases/download/peras-v3/peras-v3.nnue -o nets/peras.nnue
+curl -sL https://github.com/FirePlank/Peras-networks/releases/download/peras-v4/peras-v4.nnue -o nets/peras.nnue
 cargo build --release
 ./target/release/peras
 ```

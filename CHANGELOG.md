@@ -10,11 +10,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Version bumps are decided by what changed rather than by an accumulator:
 
-- **major** for a new evaluation or anything else that changes how the engine plays across the board
+- **major** for a major improvement, called by hand rather than by any threshold. It may be
+  one large change or the accumulation of several minor releases; what it signals is that
+  the engine is meaningfully different to play against, not that some part of it was rebuilt
 - **minor** for accumulated search and evaluation gains
 - **patch** for fixes that do not change playing strength
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
+
+## v3.4.0 (2026-09-19)
+[compare to v3.3.0](https://github.com/FirePlank/Peras/compare/v3.3.0...v3.4.0)
+
+**It is about 6 Elo better than v3.3.0.** A new network, and the inference rewritten around it.
+
+```
+Score of v3.4.0 vs v3.3.0: 460 - 423 - 1117  [0.509] 2000
+Elo: +6.4 +/- 10.1  (LOS 89.3%), 0 time losses
+10s+0.1s; the same pair is +31.4 +/- 30.8 over 300 games at a fixed 40000 nodes
+```
+
+### Changed
+- The network is `(768x16hm + threats + pawn pairs -> 1024)x2 -> (32 -> 32 -> 1) x 8`. Each
+  side's accumulator now has its two halves multiplied together before anything else sees
+  them, and the single output layer becomes three layers per material bucket, the second of
+  which is fed both its inputs and their squares. King buckets go from 10 to 16
+- Trained from scratch over 1200 superbatches on about 30 billion positions, a third more
+  data than the previous network had: 100 superbatches ramping the learning rate up and back
+  down, then 1100 annealing it from 1e-3 to 1e-6 while the training target shifts from the
+  search score towards the game result
+- Everything after the first layer is evaluated in floating point rather than integers, worth
+  about 5% of the node rate. The quantised scales needed three integer divisions and produced
+  products too wide to hold in 32 bits, so that arithmetic had no vector form
+- The first layer visits only the inputs that survive the pairwise multiplication, which is
+  about 9% of the 1024
 
 ## v3.3.0 (2026-09-15)
 [compare to v3.2.1](https://github.com/FirePlank/Peras/compare/v3.2.1...v3.3.0)

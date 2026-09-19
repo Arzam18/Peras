@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 env:
-  NET_URL: https://github.com/FirePlank/Peras-networks/releases/download/peras-v3/peras-v3.nnue
+  NET_URL: https://github.com/FirePlank/Peras-networks/releases/download/peras-v4/peras-v4.nnue
 
 jobs:
   build:
@@ -104,4 +104,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "$ASSET" --clobber
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # A tag push starts this before any release exists, and uploading to a missing
+          # release fails. All six jobs reach here at once, so whichever loses the race to
+          # create it carries on rather than failing.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Binaries for $TAG." || true
+          fi
+          gh release upload "$TAG" "$ASSET" --clobber

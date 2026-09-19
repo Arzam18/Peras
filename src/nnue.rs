@@ -6,11 +6,11 @@
 //! accumulator; `(72048 -> 1024)x2 -> 8 output buckets` with SCReLU activation, trained with
 //! bullet. Piece-square weights are `i16` and the threat and pawn-pair weights `i8`, both
 //! quantised by 255; the output layer is `i16` quantised by 64. The net is embedded in the
-//! binary. The threat and pawn-pair feature sets are the ones Stockfish 19 introduced.
+//! binary.
 //!
 //! While a move is made, the board primitives record every threat it creates or destroys
 //! (a piece's own attacks, attacks on it, and the lines it opens or closes for sliders
-//! behind it), the scheme Stockfish uses. Each ply also keeps a snapshot of the board and
+//! behind it). Each ply also keeps a snapshot of the board and
 //! pawns. The accumulators are brought up to date lazily on the first evaluation that
 //! needs them: piece-square and pawn-pair changes come from diffing snapshots, threat
 //! changes from the recorded list, and the weight rows are applied to the accumulator a
@@ -89,8 +89,12 @@ macro_rules! count {
 }
 
 pub const HL: usize = 1024;
-const INPUT_BUCKETS: usize = 10;
+/// Half the transformer, after the two halves are multiplied together.
+pub const PAIRED: usize = HL / 2;
+const INPUT_BUCKETS: usize = 16;
 const OUTPUT_BUCKETS: usize = 8;
+const L2: usize = 32;
+const L3: usize = 32;
 const PSQT_FEATURES: usize = 768 * INPUT_BUCKETS;
 const PP_FEATURES: usize = 96 * 95 / 2;
 const THREATS_PER_SIDE: usize = 29904;
@@ -99,18 +103,30 @@ const QA: i32 = 255;
 const QB: i32 = 64;
 const SCALE: i32 = 400;
 
+/// The transformer's outputs are multiplied in pairs and taken down by this much. Nine bits
+/// caps them at 127, so a pair of them fits an unsigned byte each and the first layer can
+/// use `maddubs` without saturating; it also lands the layer's output on exactly the scale
+/// its bias was stored at. The weights themselves were rescaled with a shift of 8 at save
+/// time, which is a separate constant and must not be changed here.
+const FT_SHIFT: u32 = 9;
+/// Scale of the first affine layer's output, and of its stored bias.
+const S1: i32 = 128 * 128;
+/// Scale of the second affine layer's output, and of the third's.
+const S2: i64 = (QB as i64).pow(3);
+const S3: i64 = (QB as i64).pow(4);
+
 /// King bucket by square (own perspective, a1 = 0), given for the a-d files only; the
 /// e-h files mirror onto them.
 #[rustfmt::skip]
 const BUCKET_LAYOUT: [u8; 32] = [
-    0, 1, 2, 3,
-    4, 4, 5, 5,
-    6, 6, 6, 6,
-    7, 7, 7, 7,
-    8, 8, 8, 8,
-    8, 8, 8, 8,
-    9, 9, 9, 9,
-    9, 9, 9, 9,
+     0,  1,  2,  3,
+     4,  5,  6,  7,
+     8,  8,  9,  9,
+    10, 10, 11, 11,
+    12, 12, 13, 13,
+    12, 12, 13, 13,
+    14, 14, 15, 15,
+    14, 14, 15, 15,
 ];
 
 const fn expand_buckets() -> [u8; 64] {
@@ -467,17 +483,243 @@ pub struct Accumulator {
     v: [i16; HL],
 }
 
+/// The head's weights are stored input-major: for one input, every bucket's outputs sit
+/// next to each other, so a bucket's row is a contiguous slice and the sparse first layer
+/// can accumulate a whole bucket per non-zero input.
 #[repr(C)]
 struct Network {
     psqt_weights: [Accumulator; PSQT_FEATURES],
     aux_weights: [[i8; HL]; AUX_FEATURES],
     ft_bias: Accumulator,
-    out_weights: [[i16; 2 * HL]; OUTPUT_BUCKETS],
-    out_bias: [i16; OUTPUT_BUCKETS],
+    l1_weights: [[i8; OUTPUT_BUCKETS * L2]; HL],
+    l1_bias: [i32; OUTPUT_BUCKETS * L2],
+    l2_weights: [[i32; OUTPUT_BUCKETS * L3]; L2 * 2],
+    l2_bias: [i32; OUTPUT_BUCKETS * L3],
+    l3_weights: [[i32; OUTPUT_BUCKETS]; L3],
+    l3_bias: [i32; OUTPUT_BUCKETS],
 }
 
 /// The network file is padded to a 64-byte multiple, which is exactly the struct's size.
 static NET: Network = unsafe { std::mem::transmute(*include_bytes!(env!("PERAS_NET"))) };
+
+/// The layer stack's weights, dequantised once. Past the first affine the tensors are tiny
+/// (~67 KB) but the arithmetic is awkward in integers: the scales need three divisions and
+/// the products do not fit 32 bits, which leaves no vector form on AVX2. In floats it is
+/// plain multiply-add, which is what every engine shipping a head this deep does.
+struct StackF {
+    l1_bias: [f32; OUTPUT_BUCKETS * L2],
+    l2_weights: [[f32; OUTPUT_BUCKETS * L3]; L2 * 2],
+    l2_bias: [f32; OUTPUT_BUCKETS * L3],
+    l3_weights: [[f32; OUTPUT_BUCKETS]; L3],
+    l3_bias: [f32; OUTPUT_BUCKETS],
+}
+
+/// Inputs consumed per iteration of the first affine layer.
+const CHUNK4: usize = 4;
+const CHUNKS: usize = HL / CHUNK4;
+
+/// The first layer's weights, reordered so one iteration handles four inputs at once.
+///
+/// Stored as `[bucket][chunk]` of 128 bytes: for each of a bucket's 32 outputs, that
+/// output's four weights sit together. `maddubs` against a broadcast of the four input
+/// bytes then yields two partial sums per output, and `madd` folds them into the full
+/// four-input dot product. The whole chunk is one contiguous read, which is why this shape
+/// needs no prefetching.
+struct L1Chunked {
+    w: Box<[[i8; L2 * CHUNK4]; OUTPUT_BUCKETS * CHUNKS]>,
+}
+
+static L1_CHUNKED: std::sync::OnceLock<L1Chunked> = std::sync::OnceLock::new();
+
+fn l1_chunked() -> &'static L1Chunked {
+    L1_CHUNKED.get_or_init(|| {
+        let mut w = vec![[0i8; L2 * CHUNK4]; OUTPUT_BUCKETS * CHUNKS].into_boxed_slice();
+        for bucket in 0..OUTPUT_BUCKETS {
+            for c in 0..CHUNKS {
+                let dst = &mut w[bucket * CHUNKS + c];
+                for o in 0..L2 {
+                    for k in 0..CHUNK4 {
+                        dst[o * CHUNK4 + k] = NET.l1_weights[c * CHUNK4 + k][bucket * L2 + o];
+                    }
+                }
+            }
+        }
+        L1Chunked { w: w.try_into().unwrap() }
+    })
+}
+
+static STACK_F: std::sync::OnceLock<Box<StackF>> = std::sync::OnceLock::new();
+
+fn stack_f() -> &'static StackF {
+    STACK_F.get_or_init(|| {
+        let mut s = Box::new(StackF {
+            l1_bias: [0.0; OUTPUT_BUCKETS * L2],
+            l2_weights: [[0.0; OUTPUT_BUCKETS * L3]; L2 * 2],
+            l2_bias: [0.0; OUTPUT_BUCKETS * L3],
+            l3_weights: [[0.0; OUTPUT_BUCKETS]; L3],
+            l3_bias: [0.0; OUTPUT_BUCKETS],
+        });
+        let qb = QB as f32;
+        for i in 0..OUTPUT_BUCKETS * L2 {
+            s.l1_bias[i] = NET.l1_bias[i] as f32 / S1 as f32;
+        }
+        for i in 0..L2 * 2 {
+            for o in 0..OUTPUT_BUCKETS * L3 {
+                s.l2_weights[i][o] = NET.l2_weights[i][o] as f32 / qb;
+            }
+        }
+        for o in 0..OUTPUT_BUCKETS * L3 {
+            s.l2_bias[o] = NET.l2_bias[o] as f32 / S2 as f32;
+        }
+        for i in 0..L3 {
+            for o in 0..OUTPUT_BUCKETS {
+                s.l3_weights[i][o] = NET.l3_weights[i][o] as f32 / qb;
+            }
+        }
+        for o in 0..OUTPUT_BUCKETS {
+            s.l3_bias[o] = NET.l3_bias[o] as f32 / S3 as f32;
+        }
+        s
+    })
+}
+
+/// Multiplies each perspective's two halves together, then runs the bucket's layer stack.
+/// Returns centipawns from the side to move's point of view.
+///
+/// Most of the transformer's outputs are zero once clipped, so the first layer only visits
+/// the ones that are not. The last two layers accumulate in 64 bits: the third reaches about
+/// 2.1e9, which an `i32` cannot hold.
+fn head(us: &Accumulator, them: &Accumulator, bucket: usize) -> i32 {
+    #[cfg(target_feature = "avx2")]
+    {
+        unsafe { simd::head_avx2(us, them, bucket) }
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        head_scalar(us, them, bucket)
+    }
+}
+
+/// Reference implementation of [`head`]. The vectorised path must agree with it exactly.
+#[allow(dead_code)]
+fn head_scalar(us: &Accumulator, them: &Accumulator, bucket: usize) -> i32 {
+    let mut x = [0i32; HL];
+    for (h, acc) in [us, them].into_iter().enumerate() {
+        for j in 0..PAIRED {
+            let lo = i32::from(acc.v[j].clamp(0, QA as i16));
+            let hi = i32::from(acc.v[j + PAIRED].clamp(0, QA as i16));
+            x[h * PAIRED + j] = (lo * hi) >> FT_SHIFT;
+        }
+    }
+
+    let b1 = bucket * L2;
+    let mut a1 = [0i32; L2];
+    for (i, &xi) in x.iter().enumerate() {
+        if xi == 0 {
+            continue;
+        }
+        let row = &NET.l1_weights[i][b1..b1 + L2];
+        for (a, &w) in a1.iter_mut().zip(row) {
+            *a += xi * i32::from(w);
+        }
+    }
+
+    stack(&a1, bucket)
+}
+
+/// Second affine layer's weight sums, before its bias.
+#[inline]
+fn l2_accumulate(h2: &[f32; L2 * 2], b2: usize) -> [f32; L3] {
+    #[cfg(target_feature = "avx2")]
+    {
+        unsafe { simd::l2_avx2(h2, b2) }
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        l2_scalar(h2, b2)
+    }
+}
+
+/// Reference for [`l2_accumulate`]; the vectorised path must agree with it closely.
+#[allow(dead_code)]
+fn l2_scalar(h2: &[f32; L2 * 2], b2: usize) -> [f32; L3] {
+    let s = stack_f();
+    let mut a2 = [0f32; L3];
+    for (i, &h) in h2.iter().enumerate() {
+        let row = &s.l2_weights[i][b2..b2 + L3];
+        for (a, &w) in a2.iter_mut().zip(row) {
+            *a += h * w;
+        }
+    }
+    a2
+}
+
+/// The two layers after the first affine, shared by both code paths. `a1` is the first
+/// layer's weight sum, before its bias.
+fn stack(a1: &[i32; L2], bucket: usize) -> i32 {
+    stack_flt(a1, bucket)
+}
+
+/// Integer layer stack. Kept alongside [`stack_flt`] so the two can be timed against each
+/// other in one process; this machine's wall clock cannot resolve the difference between
+/// separate runs.
+#[allow(dead_code)]
+fn stack_int(a1: &[i32; L2], bucket: usize) -> i32 {
+    let b1 = bucket * L2;
+    let mut h2 = [0i64; L2 * 2];
+    for k in 0..L2 {
+        let v = a1[k] + NET.l1_bias[b1 + k];
+        h2[k] = i64::from(v.clamp(0, S1));
+        let c = i64::from(v.clamp(-S1, S1));
+        h2[L2 + k] = (c * c / i64::from(S1)).min(i64::from(S1));
+    }
+
+    let b2 = bucket * L3;
+    let mut a2 = [0i64; L3];
+    for (i, &h) in h2.iter().enumerate() {
+        let row = &NET.l2_weights[i][b2..b2 + L3];
+        for (a, &w) in a2.iter_mut().zip(row) {
+            *a += h * i64::from(w);
+        }
+    }
+
+    let mut h3 = [0i64; L3];
+    for k in 0..L3 {
+        let v = a2[k] * i64::from(QB) * i64::from(QB) / i64::from(S1) + i64::from(NET.l2_bias[b2 + k]);
+        h3[k] = v.clamp(0, S2);
+    }
+
+    let mut out = i64::from(NET.l3_bias[bucket]);
+    for (i, &h) in h3.iter().enumerate() {
+        out += h * i64::from(NET.l3_weights[i][bucket]);
+    }
+    (out * i64::from(SCALE) / S3) as i32
+}
+
+fn stack_flt(a1: &[i32; L2], bucket: usize) -> i32 {
+    let s = stack_f();
+    let b1 = bucket * L2;
+    let mut h2 = [0f32; L2 * 2];
+    for k in 0..L2 {
+        let v = a1[k] as f32 / S1 as f32 + s.l1_bias[b1 + k];
+        h2[k] = v.clamp(0.0, 1.0);
+        // The square is taken before clipping, so a negative output still contributes.
+        h2[L2 + k] = (v * v).min(1.0);
+    }
+
+    let b2 = bucket * L3;
+    let mut a2 = l2_accumulate(&h2, b2);
+
+    for (k, v) in a2.iter_mut().enumerate() {
+        *v = (*v + s.l2_bias[b2 + k]).clamp(0.0, 1.0);
+    }
+
+    let mut out = s.l3_bias[bucket];
+    for (i, &h) in a2.iter().enumerate() {
+        out += h * s.l3_weights[i][bucket];
+    }
+    (out * SCALE as f32) as i32
+}
 
 /// What the network sees of a position: the board, every non-king piece's attacks on
 /// non-king pieces, and where the pawns and kings are.
@@ -1043,11 +1285,9 @@ impl NnueState {
         }
         let e = &self.stack[self.top];
         let bucket = ((count - 2).max(0) as usize / (32 / OUTPUT_BUCKETS)).min(OUTPUT_BUCKETS - 1);
-        let w = &NET.out_weights[bucket];
         let (us, them) = (&e.acc[stm.idx()], &e.acc[stm.flip().idx()]);
         count!(EVALS, 1);
-        let sum = timed!(DOT, simd::dot_screlu(us, &w[..HL]) + simd::dot_screlu(them, &w[HL..]));
-        (sum / QA + i32::from(NET.out_bias[bucket])) * SCALE / (QA * QB)
+        timed!(DOT, head(us, them, bucket))
     }
 
     /// How to bring `p`'s top accumulator up to date: rebuild it from the cache, or replay
@@ -1203,7 +1443,7 @@ fn psqt_feature(p: Color, bucket: usize, flip: u8, pc: Piece, sq: Square) -> usi
 
 #[cfg(target_feature = "avx2")]
 mod simd {
-    use super::{Accumulator, HL, Lists, NET, QA};
+    use super::{Accumulator, CHUNKS, FT_SHIFT, HL, L2, L3, Lists, NET, PAIRED, QA};
     use std::arch::x86_64::*;
 
     const CHUNK: usize = 16;
@@ -1290,34 +1530,151 @@ mod simd {
         }
     }
 
-    /// `sum(screlu(acc[i]) * w[i])`. The clipped value (at most 255) times the weight (at
-    /// most 127 in magnitude) fits an `i16`, so the square goes through `madd`.
+    /// Clips both halves of `acc`, multiplies them together and writes the 512 bytes to
+    /// `out`. `mulhi` on a pre-shifted operand does the shift for free.
     #[inline]
-    pub fn dot_screlu(acc: &Accumulator, w: &[i16]) -> i32 {
-        unsafe {
-            let zero = _mm256_setzero_si256();
-            let qa = _mm256_set1_epi16(QA as i16);
-            let mut sum = _mm256_setzero_si256();
-            for c in (0..HL).step_by(CHUNK) {
-                let x = _mm256_load_si256(acc.v.as_ptr().add(c) as *const __m256i);
-                let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), qa);
-                let wv = _mm256_loadu_si256(w.as_ptr().add(c) as *const __m256i);
-                let xw = _mm256_mullo_epi16(x, wv);
-                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(xw, x));
+    unsafe fn pairwise(acc: &Accumulator, out: *mut u8) {
+        let zero = _mm256_setzero_si256();
+        let qa = _mm256_set1_epi16(QA as i16);
+        let mut j = 0;
+        while j < PAIRED {
+            let mut packed = [_mm256_setzero_si256(); 2];
+            for (h, slot) in packed.iter_mut().enumerate() {
+                let o = j + h * CHUNK;
+                let lo = _mm256_load_si256(acc.v.as_ptr().add(o) as *const __m256i);
+                let hi = _mm256_load_si256(acc.v.as_ptr().add(o + PAIRED) as *const __m256i);
+                let lo = _mm256_min_epi16(_mm256_max_epi16(lo, zero), qa);
+                let hi = _mm256_min_epi16(_mm256_max_epi16(hi, zero), qa);
+                // (lo * hi) >> FT_SHIFT, keeping the product in 16 bits throughout.
+                *slot = _mm256_mulhi_epu16(_mm256_slli_epi16(lo, 16 - FT_SHIFT as i32), hi);
             }
-            let hi = _mm256_extracti128_si256(sum, 1);
-            let lo = _mm256_castsi256_si128(sum);
-            let s = _mm_add_epi32(lo, hi);
-            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
-            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01));
-            _mm_cvtsi128_si32(s)
+            // packus interleaves the two 128-bit lanes, so undo that.
+            let bytes = _mm256_packus_epi16(packed[0], packed[1]);
+            let bytes = _mm256_permute4x64_epi64(bytes, 0b11_01_10_00);
+            _mm256_storeu_si256(out.add(j) as *mut __m256i, bytes);
+            j += 2 * CHUNK;
         }
+    }
+
+    /// Pairwise transformer output, then the bucket's layer stack.
+    ///
+    /// The first layer visits only non-zero inputs, two at a time: with the activations
+    /// capped at 127 a pair of products cannot saturate `maddubs`, so one instruction
+    /// accumulates both inputs' contributions to sixteen outputs.
+    pub unsafe fn head_avx2(us: &Accumulator, them: &Accumulator, bucket: usize) -> i32 {
+        let mut x = [0u8; HL];
+        pairwise(us, x.as_mut_ptr());
+        pairwise(them, x.as_mut_ptr().add(PAIRED));
+        // Byte-granular rather than four-input chunks: at the ~9% density this net produces,
+        // grouping inputs in fours makes a third of the chunks live, and the coarser skip
+        // cancels out the cheaper iteration (measured at 1.02x, i.e. nothing). Chunking wins
+        // from about 25% density upwards, so `l1_chunk4` is kept for a denser net.
+        let a1 = l1_bytewise(&x, bucket);
+        super::stack(&a1, bucket)
+    }
+
+    /// First affine layer over four inputs at a time, reading one contiguous 128-byte chunk
+    /// of reordered weights per iteration. A chunk is live if any of its four bytes is, so
+    /// this trades a coarser skip for much cheaper iterations.
+    pub unsafe fn l1_chunk4(x: &[u8; HL], bucket: usize) -> [i32; L2] {
+        let base = super::l1_chunked().w.as_ptr().add(bucket * CHUNKS);
+        let x32 = x.as_ptr() as *const i32;
+        let zero = _mm256_setzero_si256();
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [zero; L2 / 8];
+        for blk in 0..CHUNKS / 8 {
+            let v = _mm256_loadu_si256(x32.add(blk * 8) as *const __m256i);
+            let mut m = !(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, zero))) as u32) & 0xFF;
+            while m != 0 {
+                let c = blk * 8 + m.trailing_zeros() as usize;
+                m &= m - 1;
+                let inv = _mm256_set1_epi32(*x32.add(c));
+                let wp = (*base.add(c)).as_ptr();
+                for (g, a) in acc.iter_mut().enumerate() {
+                    let w = _mm256_loadu_si256(wp.add(g * 32) as *const __m256i);
+                    *a = _mm256_add_epi32(*a, _mm256_madd_epi16(_mm256_maddubs_epi16(inv, w), ones));
+                }
+            }
+        }
+        let mut a1 = [0i32; L2];
+        for (g, a) in acc.iter().enumerate() {
+            _mm256_storeu_si256(a1.as_mut_ptr().add(g * 8) as *mut __m256i, *a);
+        }
+        a1
+    }
+
+    /// Byte-granular first layer, kept so the two can be timed against each other.
+    pub unsafe fn l1_bytewise(x: &[u8; HL], bucket: usize) -> [i32; L2] {
+        let zero = _mm256_setzero_si256();
+        let mut nz = [0u16; HL];
+        let mut cnt = 0usize;
+        for c in (0..HL).step_by(32) {
+            let v = _mm256_loadu_si256(x.as_ptr().add(c) as *const __m256i);
+            let mut m = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)) as u32);
+            while m != 0 {
+                *nz.get_unchecked_mut(cnt) = (c + m.trailing_zeros() as usize) as u16;
+                cnt += 1;
+                m &= m - 1;
+            }
+        }
+
+        // maddubs pairs adjacent bytes, so the unpacked weights arrive as outputs
+        // 0-7, 16-23 from the low half and 8-15, 24-31 from the high half.
+        let (mut a, mut b, mut c2, mut d) = (zero, zero, zero, zero);
+        let mut k = 0;
+        while k < cnt {
+            let i1 = *nz.get_unchecked(k) as usize;
+            let (i2, x2) = if k + 1 < cnt {
+                let i = *nz.get_unchecked(k + 1) as usize;
+                (i, u32::from(*x.get_unchecked(i)))
+            } else {
+                (i1, 0)
+            };
+            let xv = _mm256_set1_epi16((u32::from(*x.get_unchecked(i1)) | (x2 << 8)) as i16);
+            let w1 = _mm256_loadu_si256(NET.l1_weights[i1].as_ptr().add(bucket * L2) as *const __m256i);
+            let w2 = _mm256_loadu_si256(NET.l1_weights[i2].as_ptr().add(bucket * L2) as *const __m256i);
+            let lo = _mm256_maddubs_epi16(xv, _mm256_unpacklo_epi8(w1, w2));
+            let hi = _mm256_maddubs_epi16(xv, _mm256_unpackhi_epi8(w1, w2));
+            a = _mm256_add_epi32(a, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(lo)));
+            b = _mm256_add_epi32(b, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(lo, 1)));
+            c2 = _mm256_add_epi32(c2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(hi)));
+            d = _mm256_add_epi32(d, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(hi, 1)));
+            k += 2;
+        }
+
+        let mut a1 = [0i32; L2];
+        _mm256_storeu_si256(a1.as_mut_ptr() as *mut __m256i, a);
+        _mm256_storeu_si256(a1.as_mut_ptr().add(8) as *mut __m256i, c2);
+        _mm256_storeu_si256(a1.as_mut_ptr().add(16) as *mut __m256i, b);
+        _mm256_storeu_si256(a1.as_mut_ptr().add(24) as *mut __m256i, d);
+        a1
+    }
+
+    /// Second affine layer. The weights are input-major, so a bucket's 32 outputs sit
+    /// contiguously for each input and the whole layer is four running accumulators fed by
+    /// one broadcast per input.
+    pub unsafe fn l2_avx2(h2: &[f32; L2 * 2], b2: usize) -> [f32; L3] {
+        let s = super::stack_f();
+        let mut acc = [_mm256_setzero_ps(); 4];
+        for (i, &h) in h2.iter().enumerate() {
+            let hv = _mm256_set1_ps(h);
+            let row = s.l2_weights.get_unchecked(i).as_ptr().add(b2);
+            for (k, a) in acc.iter_mut().enumerate() {
+                let w = _mm256_loadu_ps(row.add(k * 8));
+                *a = _mm256_fmadd_ps(hv, w, *a);
+            }
+        }
+        let mut out = [0f32; L3];
+        for (k, a) in acc.iter().enumerate() {
+            _mm256_storeu_ps(out.as_mut_ptr().add(k * 8), *a);
+        }
+        out
     }
 }
 
 #[cfg(not(target_feature = "avx2"))]
 mod simd {
-    use super::{Accumulator, HL, Lists, NET, QA};
+    use super::{Accumulator, HL, Lists, NET};
 
     pub fn update(src: &Accumulator, dst: &mut Accumulator, d: &Lists) {
         dst.v = src.v;
@@ -1347,14 +1704,6 @@ mod simd {
         }
     }
 
-    pub fn dot_screlu(acc: &Accumulator, w: &[i16]) -> i32 {
-        let mut sum = 0i32;
-        for i in 0..HL {
-            let x = i32::from(acc.v[i]).clamp(0, QA);
-            sum += x * x * i32::from(w[i]);
-        }
-        sum
-    }
 }
 
 #[cfg(test)]
@@ -1594,17 +1943,217 @@ mod tests {
             println!("acc update, 20 rows {label:10}: {:6.0} ns", t.elapsed().as_nanos() as f64 / reps as f64);
         }
 
+        // Perturb the accumulator and vary the bucket each iteration, or the whole call is
+        // loop-invariant and gets hoisted out.
         let t = Instant::now();
-        for _ in 0..n {
-            acc = acc.wrapping_add(simd::dot_screlu(&a, &NET.out_weights[3][..HL]) as u64);
+        for i in 0..n {
+            a.v[i % HL] = a.v[i % HL].wrapping_add(1);
+            acc = acc.wrapping_add(head(&a, &a, i % OUTPUT_BUCKETS) as u64);
         }
-        println!("dot (one side):   {:6.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+        println!("head:             {:6.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+
+        // Wall-clock times from separate runs are useless here: the same binary varies by
+        // 15% between invocations. Timing both variants micro-seconds apart in one process
+        // cancels that, because whatever the machine is doing affects them equally. The
+        // ratio is the measurement; the absolute numbers are not.
+        {
+            let mut inputs = [[0i32; L2]; 64];
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            for row in inputs.iter_mut() {
+                for v in row.iter_mut() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    *v = (seed % (4 * S1 as u64)) as i32 - 2 * S1;
+                }
+            }
+            let reps = 20000;
+            let mut ratios = Vec::new();
+            let (mut ta, mut tb) = (0u128, 0u128);
+            for trial in 0..25 {
+                let t = Instant::now();
+                for i in 0..reps {
+                    acc = acc.wrapping_add(stack_int(&inputs[i % 64], i % OUTPUT_BUCKETS) as u64);
+                }
+                let ea = t.elapsed().as_nanos();
+                let t = Instant::now();
+                for i in 0..reps {
+                    acc = acc.wrapping_add(stack_flt(&inputs[i % 64], i % OUTPUT_BUCKETS) as u64);
+                }
+                let eb = t.elapsed().as_nanos();
+                if trial >= 5 {
+                    ta += ea;
+                    tb += eb;
+                    ratios.push(eb as f64 / ea as f64);
+                }
+            }
+            ratios.sort_by(|x: &f64, y: &f64| x.partial_cmp(y).unwrap());
+            let n2 = (ratios.len() * reps) as f64;
+            println!(
+                "stack int:        {:6.1} ns\nstack float:      {:6.1} ns\nfloat/int ratio:   {:.3} (median, {:.3}..{:.3} over {} paired trials)",
+                ta as f64 / n2,
+                tb as f64 / n2,
+                ratios[ratios.len() / 2],
+                ratios[0],
+                ratios[ratios.len() - 1],
+                ratios.len(),
+            );
+        }
+
+        // Same paired method for the two first-layer shapes, on activations at the density
+        // real positions produce (~9% of the 1024 inputs non-zero).
+        #[cfg(target_feature = "avx2")]
+        {
+            for live in [96usize, 256, 512] {
+            let mut xs = [[0u8; HL]; 16];
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            for x in xs.iter_mut() {
+                for _ in 0..live {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    x[(seed % HL as u64) as usize] = (seed % 127 + 1) as u8;
+                }
+            }
+            let reps = 20000;
+            let mut ratios: Vec<f64> = Vec::new();
+            let (mut ta, mut tb) = (0u128, 0u128);
+            for trial in 0..25 {
+                let t = Instant::now();
+                for i in 0..reps {
+                    acc = acc.wrapping_add(unsafe { simd::l1_bytewise(&xs[i % 16], i % OUTPUT_BUCKETS) }[0] as u64);
+                }
+                let ea = t.elapsed().as_nanos();
+                let t = Instant::now();
+                for i in 0..reps {
+                    acc = acc.wrapping_add(unsafe { simd::l1_chunk4(&xs[i % 16], i % OUTPUT_BUCKETS) }[0] as u64);
+                }
+                let eb = t.elapsed().as_nanos();
+                if trial >= 5 {
+                    ta += ea;
+                    tb += eb;
+                    ratios.push(eb as f64 / ea as f64);
+                }
+            }
+            ratios.sort_by(|x: &f64, y: &f64| x.partial_cmp(y).unwrap());
+            let n2 = (ratios.len() * reps) as f64;
+            println!(
+                "density {:>4}/1024: bytewise {:6.1} ns, chunk4 {:6.1} ns, ratio {:.3} ({:.3}..{:.3})",
+                live,
+                ta as f64 / n2,
+                tb as f64 / n2,
+                ratios[ratios.len() / 2],
+                ratios[0],
+                ratios[ratios.len() - 1],
+            );
+            }
+        }
 
         let t = Instant::now();
         for _ in 0..n {
             acc = acc.wrapping_add(evaluate(&mut pos) as u64);
         }
         println!("evaluate (cached):{:6.1} ns   [{acc}]", t.elapsed().as_nanos() as f64 / n as f64);
+    }
+
+    /// The vectorised head must agree with the reference on every bucket, including the
+    /// saturating corners: accumulators pinned at the clip bounds and an odd number of
+    /// non-zero inputs, which is the case the pairing has to special-case.
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn simd_head_matches_scalar() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..200 {
+            let mut fill = |acc: &mut Accumulator| {
+                for v in acc.v.iter_mut() {
+                    *v = match case % 4 {
+                        // mostly zero, so few inputs survive the clip
+                        0 => (next() % 5) as i16 - 4,
+                        // pinned at the bounds
+                        1 => [0, QA as i16, -1, 3000][(next() % 4) as usize],
+                        2 => (next() % 600) as i16 - 300,
+                        _ => (next() % 64_000) as i16 - 32_000,
+                    };
+                }
+            };
+            let mut us = Accumulator { v: [0; HL] };
+            let mut them = Accumulator { v: [0; HL] };
+            fill(&mut us);
+            fill(&mut them);
+            for bucket in 0..OUTPUT_BUCKETS {
+                let want = head_scalar(&us, &them, bucket);
+                let got = unsafe { simd::head_avx2(&us, &them, bucket) };
+                assert_eq!(want, got, "case {case}, bucket {bucket}");
+            }
+        }
+    }
+
+    /// The vectorised second layer must agree with the reference. This needs its own test:
+    /// both heads route through the dispatching accumulator, so `simd_head_matches_scalar`
+    /// would compare the vectorised path against itself.
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn simd_l2_matches_scalar() {
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300 {
+            let mut h2 = [0f32; L2 * 2];
+            for v in h2.iter_mut() {
+                *v = match case % 3 {
+                    // the activation bounds, where the accumulation is largest
+                    0 => 1.0,
+                    1 => 0.0,
+                    _ => (next() % 1_000_001) as f32 / 1.0e6,
+                };
+            }
+            for bucket in 0..OUTPUT_BUCKETS {
+                let b2 = bucket * L3;
+                let want = l2_scalar(&h2, b2);
+                let got = unsafe { simd::l2_avx2(&h2, b2) };
+                for (k, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+                    // fused multiply-add rounds once where the reference rounds twice
+                    assert!((w - g).abs() < 1e-3, "case {case}, bucket {bucket}, lane {k}: {w} vs {g}");
+                }
+            }
+        }
+    }
+
+    /// Reordering the first layer's weights must not change what it computes.
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn chunked_l1_matches_bytewise() {
+        let mut seed = 0xB5AD_4ECE_DA1C_E2A9u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..200 {
+            let mut x = [0u8; HL];
+            // Densities either side of the ~9% seen on real positions, plus the extremes,
+            // since the two paths skip work at different granularities.
+            let live = [0usize, 1, 20, 96, 400, HL][case % 6];
+            for _ in 0..live {
+                x[(next() % HL as u64) as usize] = (next() % 128) as u8;
+            }
+            for bucket in 0..OUTPUT_BUCKETS {
+                let want = unsafe { simd::l1_bytewise(&x, bucket) };
+                let got = unsafe { simd::l1_chunk4(&x, bucket) };
+                assert_eq!(want, got, "case {case}, live {live}, bucket {bucket}");
+            }
+        }
     }
 
     /// Every move's recorded threat changes must equal the difference of the attack sets.
