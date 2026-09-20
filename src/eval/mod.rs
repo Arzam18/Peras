@@ -1,6 +1,6 @@
 //! Static evaluation entry point: insufficient-material draws, the network (or, for the
-//! variants it was not trained for, the hand-crafted evaluation), endgame mop-up guidance
-//! and fifty-move damping.
+//! variants it was not trained for, the hand-crafted evaluation), the KX-vs-K
+//! specialisation and fifty-move damping.
 
 #[cfg(feature = "variants")]
 pub mod hce;
@@ -12,10 +12,6 @@ use crate::bitboard::*;
 use crate::position::Position;
 use crate::types::*;
 
-/// Largest slice of the evaluation the halfmove-clock damping may remove while a
-/// mop-up term is active: TT scores don't know the clock, so fully damping a huge
-/// mop-up eval lets stale shuffle scores beat fresh progress.
-const RULE50_DAMP_CAP: Value = 700;
 
 /// Evaluation from the side to move's perspective, clamped below the mate range.
 #[inline]
@@ -26,24 +22,26 @@ pub fn evaluate(pos: &mut Position) -> Value {
         Variant::RacingKings => return variants::racing_kings(pos).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX),
         Variant::ThreeCheck => {
             let v = hce::evaluate(pos) + variants::three_check_bonus(pos);
-            return apply_rule50_damping(pos, v, false).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX);
+            return apply_rule50_damping(pos, v).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX);
         }
         Variant::Crazyhouse => {
             let v = hce::evaluate(pos) + variants::crazyhouse_hand(pos);
-            return apply_rule50_damping(pos, v, false).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX);
+            return apply_rule50_damping(pos, v).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX);
         }
         Variant::KingOfTheHill => {
             let v = hce::evaluate(pos) + variants::king_of_the_hill_bonus(pos);
-            return apply_rule50_damping(pos, v, false).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX);
+            return apply_rule50_damping(pos, v).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX);
         }
         _ => {}
     }
     if pos.is_insufficient_material() {
         return VALUE_DRAW;
     }
+    if let Some(v) = mopup::kx_vs_k(pos) {
+        return apply_rule50_damping(pos, v).clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX);
+    }
     let raw = pos.nnue_evaluate();
-    let (mop, mop_active) = mopup::mop_up_term(pos);
-    let v = apply_rule50_damping(pos, raw + mop, mop_active);
+    let v = apply_rule50_damping(pos, raw);
     v.clamp(-VALUE_EVAL_MAX, VALUE_EVAL_MAX)
 }
 
@@ -69,13 +67,12 @@ pub fn side_cannot_mate(pos: &Position, c: Color) -> bool {
 }
 
 #[inline]
-fn apply_rule50_damping(pos: &Position, v: Value, mop_active: bool) -> Value {
+fn apply_rule50_damping(pos: &Position, v: Value) -> Value {
     let clock = pos.rule50_count().min(199);
     if clock == 0 {
         return v;
     }
-    let dampable = if mop_active { v.clamp(-RULE50_DAMP_CAP, RULE50_DAMP_CAP) } else { v };
-    v - dampable * clock / 199
+    v - v * clock / 199
 }
 
 #[cfg(test)]

@@ -18,6 +18,48 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.6.0 (2026-09-21)
+[compare to v3.5.0](https://github.com/FirePlank/Peras/compare/v3.5.0...v3.6.0)
+
+**It is about 7 Elo better than v3.5.0.** The engine could not reliably force elementary
+mates, and threw away won endgames by shuffling until the fifty-move rule took them.
+
+```
+Score of v3.6.0 vs v3.5.0: 223 - 202 - 618  [0.510] 1043
+Elo: +6.7 +/- 13.5  (LOS 83.4%), 0 time losses
+10s+0.1s, resignation adjudication off so won endgames have to be converted
+```
+
+Over a fixed-node suite of elementary mates, twelve random placements of each material set,
+scored on mate arriving before the fifty-move rule:
+
+```
+                v3.5.0   v3.6.0
+KQ vs K           9/12    12/12
+KR vs K           4/12    12/12
+KRR vs K         12/12    12/12
+KRN vs K         10/12    12/12
+KBB vs K          5/12    12/12
+KBN vs K          1/12     9/12
+total            41/72    69/72
+```
+
+### Changed
+- KX vs K now has its own evaluation rather than a bonus added to the network's. The network
+  reads the material, saturates, and offers nothing further to steer by, so the guidance was
+  the smaller term and the winning side drifted. It is replaced outright: a constant saying
+  the position is won, plus a gradient that drives the bare king to an edge and brings our
+  own king with it. K+B+N aims at the two corners its bishop attacks, since the generic edge
+  term pulls just as hard toward the two that cannot mate
+- The score that guidance carries is deliberately modest. An earlier attempt used a much
+  larger one and cost eight ply of search depth at equal nodes, because an evaluation that
+  size dwarfs every margin the search prunes against
+- Reported scores no longer stop the halfmove clock from damping the evaluation. That
+  exemption existed to protect the old mop-up term, and its side effect was that a won
+  position lost only a tenth of its score over the whole fifty-move span, so nothing pushed
+  the engine to make progress. It would sit on a winning endgame for forty moves and only
+  then advance a pawn
+
 ## v3.5.0 (2026-09-19)
 [compare to v3.4.0](https://github.com/FirePlank/Peras/compare/v3.4.0...v3.5.0)
 
