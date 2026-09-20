@@ -4,10 +4,6 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to build and upload to (e.g. v3.0.0)"
-        required: true
 
 permissions:
   contents: write
@@ -25,8 +21,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -54,7 +48,10 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          RAW_TAG="${GITHUB_REF_NAME}"
+          # Replace invalid spaces or characters in the ref name automatically
+          TAG=$(echo "$RAW_TAG" | tr ' ' '_')
+          
           DIR="peras-${TAG#v}-android-arm64"
           mkdir -p "$DIR"
           BIN=target/${{ env.TARGET }}/release/peras
@@ -66,13 +63,14 @@ jobs:
           
           tar czf "$DIR.tar.gz" "$DIR"
           echo "ASSET=$DIR.tar.gz" >> $GITHUB_ENV
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
 
       - name: Upload to Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="${RELEASE_TAG}"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             cat > notes.md <<'NOTES'
           ## Android Release
