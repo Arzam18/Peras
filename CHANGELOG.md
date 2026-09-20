@@ -18,6 +18,30 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.5.0 (2026-09-19)
+[compare to v3.4.0](https://github.com/FirePlank/Peras/compare/v3.4.0...v3.5.0)
+
+**It is about 3 Elo better than v3.4.0.** Search changes carried over from this engine's
+sibling project, which shares the same search core.
+
+```
+Score of v3.5.0 vs v3.4.0: 500 - 485 - 1310  [0.503] 2295
+Elo: +2.7 +/- 9.3  (LOS 71.7%), 0 time losses
+10s+0.1s
+```
+
+### Changed
+- Late move reductions no longer shorten for a transposition-table PV, and extend by one
+  when the table move is a capture
+- Main history fades to 729/1024 between searches rather than being cleared, so the previous
+  search's move ordering survives as a hint
+- The move picker gathers bad quiets at the front of the list during the good pass, the way
+  bad captures already were, instead of walking every quiet a second time. The bench node
+  count is unchanged either way
+- The reported-score normalisation is refitted for the new network. A shown +1.00 was
+  reached about 18% too early, overstating the position. Fitted over 684k eval/result
+  pairs from 12000 of this engine's own games. Reported scores only
+
 ## v3.4.0 (2026-09-19)
 [compare to v3.3.0](https://github.com/FirePlank/Peras/compare/v3.3.0...v3.4.0)
 

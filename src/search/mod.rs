@@ -402,6 +402,13 @@ impl Searcher {
         for row in self.hist.low_ply.iter_mut() {
             row.fill(97);
         }
+        // Carry the previous search's main history across, faded rather than kept whole:
+        // the position has moved on two plies, so it is a hint and not evidence.
+        for row in self.hist.main.iter_mut() {
+            for v in row.iter_mut() {
+                *v = *v * 729 / 1024;
+            }
+        }
     }
 
     // History helpers
@@ -1500,10 +1507,12 @@ impl Searcher {
                     if !improving {
                         reduction += 1;
                     }
-                    if tt_pv {
-                        reduction -= 1;
-                    }
                     if cut_node {
+                        reduction += 1;
+                    }
+                    // A transposition-table move that captures is usually the only move
+                    // worth much here, so the rest can be looked at more cheaply.
+                    if tt_capture {
                         reduction += 1;
                     }
                     let hist_score = self.hist.main[us.idx()][m.from_to()];

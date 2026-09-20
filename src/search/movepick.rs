@@ -47,6 +47,11 @@ pub struct MovePicker {
     end_bad_captures: usize,
     end_captures: usize,
     end_generated: usize,
+    /// Where the quiets start, and how far the ones held back for later reach. The good
+    /// pass compacts the rest to the front as it goes, the way bad captures already are,
+    /// so the bad pass reads a range instead of walking every quiet a second time.
+    quiet_start: usize,
+    end_bad_quiets: usize,
     ply: usize,
     depth: i32,
     threshold: Value,
@@ -119,6 +124,8 @@ impl MovePicker {
             end_bad_captures: 0,
             end_captures: 0,
             end_generated: 0,
+            quiet_start: 0,
+            end_bad_quiets: 0,
             ply,
             depth,
             threshold,
@@ -348,6 +355,8 @@ impl MovePicker {
                     let limit = -QUIET_SORT_LIMIT_PER_DEPTH * self.depth;
                     partial_sort(&mut self.moves[quiet_start..self.end_generated], limit);
                     self.cur = quiet_start;
+                    self.quiet_start = quiet_start;
+                    self.end_bad_quiets = quiet_start;
                     self.stage = Stage::GoodQuiet;
                 }
 
@@ -363,6 +372,10 @@ impl MovePicker {
                         if sm.score > GOOD_QUIET_THRESHOLD {
                             return Some(sm.m);
                         }
+                        // Gather it at the front for the bad pass. Only moves already
+                        // handed out get displaced, and they are never revisited.
+                        self.moves.swap(self.end_bad_quiets, self.cur - 1);
+                        self.end_bad_quiets += 1;
                     }
                     self.cur = 0;
                     self.stage = Stage::BadCapture;
@@ -374,7 +387,7 @@ impl MovePicker {
                         self.cur += 1;
                         return Some(m);
                     }
-                    self.cur = self.end_captures;
+                    self.cur = self.quiet_start;
                     self.stage = Stage::BadQuiet;
                 }
 
@@ -383,12 +396,10 @@ impl MovePicker {
                         self.stage = Stage::Done;
                         return None;
                     }
-                    while self.cur < self.end_generated {
-                        let sm = self.moves[self.cur];
+                    if self.cur < self.end_bad_quiets {
+                        let m = self.moves[self.cur].m;
                         self.cur += 1;
-                        if sm.score <= GOOD_QUIET_THRESHOLD {
-                            return Some(sm.m);
-                        }
+                        return Some(m);
                     }
                     self.stage = Stage::Done;
                 }

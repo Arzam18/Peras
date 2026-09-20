@@ -139,16 +139,17 @@ pub const LMR_CORR_DIVISOR: i32 = 15185;
 // score `v` is `1 / (1 + exp((a - v) / b))`, where `a` is the score that wins half the
 // time and `b` sets how quickly that changes. Both move with the material on the board,
 // because the same score converts far more often with a full board than in a sparse
-// endgame. Fitted over 1.5M eval/result pairs from 20000 of this engine's own games,
-// binned into nine material bands: `a` runs from 320 in the sparsest to 230 with
-// everything on, and a line in `m` reproduces all nine to within 7cp.
+// endgame. The constants describe the network and are refitted when it changes: by
+// maximum likelihood over 684k eval/result pairs from 12000 of this engine's own games,
+// binned into nine material bands. `a` runs from 366 in the sparsest to 274 with
+// everything on, and a line in `m` reproduces all nine to within 13cp.
 
 // Scaled by 1000 to keep this integer. `m` is the material count over 58, clamped to the
 // range the fit covers.
-pub const WDL_A_INTERCEPT: i32 = 357_200;
-pub const WDL_A_SLOPE: i32 = -97_300;
-pub const WDL_B_INTERCEPT: i32 = 72_300;
-pub const WDL_B_SLOPE: i32 = 48_600;
+pub const WDL_A_INTERCEPT: i32 = 411_111;
+pub const WDL_A_SLOPE: i32 = -103_382;
+pub const WDL_B_INTERCEPT: i32 = 74_879;
+pub const WDL_B_SLOPE: i32 = 41_764;
 pub const WDL_MATERIAL_ANCHOR: i32 = 58;
 pub const WDL_MATERIAL_MIN: i32 = 17;
 pub const WDL_MATERIAL_MAX: i32 = 78;
