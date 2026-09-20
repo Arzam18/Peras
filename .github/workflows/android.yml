@@ -1,4 +1,4 @@
-Name: Release Android Binary
+name: Release Android Binary
 
 on:
   push:
