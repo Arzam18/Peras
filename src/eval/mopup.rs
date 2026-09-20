@@ -1,79 +1,95 @@
-//! KX-vs-K mating guidance. The board edge does the confining work, so a small
-//! tiebreaker suffices: drive the bare king to the edge, keep our king close, and
-//! for KBN aim at a corner the bishop controls.
+//! KX-vs-K specialised evaluation.
+//!
+//! The network is poor at forcing these mates: it reads the material, saturates, and then
+//! offers nothing to steer by once the bare king is loose, so the winning side drifts until
+//! the fifty-move rule takes the win away. A bonus added on top of that cannot fix it,
+//! because the network's own noise is the larger term. Instead the evaluation is replaced
+//! outright, the way a mate is really scored: a constant saying the position is won, plus a
+//! small gradient that always points at the mate.
 
 use crate::bitboard::*;
 use crate::position::Position;
 use crate::types::*;
 
-/// Manhattan distance from the board centre, 0 (d4/e4/d5/e5) to 6 (corners).
-#[rustfmt::skip]
-const CENTER_DIST: [i32; 8] = [3, 2, 1, 0, 0, 1, 2, 3];
+/// Base score for a position the winning side mates from by force. Far above any shaping
+/// below, and far enough below the mate range to still read as an evaluation.
+const KNOWN_WIN: Value = 2000;
 
-/// Winning lead (in SEE material) before the guidance is applied at all.
-const MIN_LEAD: Value = 250;
-/// Ceiling of the term against a defended king so shaping never outweighs material.
-const DEFENDED_CAP: Value = 200;
-const BARE_CAP: Value = 450;
+/// Weight on the corner term for K+B+N, which has to outweigh everything else: the mate
+/// exists in only two of the four corners, so steering into a wrong one is a lost game.
+const CORNER_WEIGHT: i32 = 560;
 
+/// Distance from the nearer edge, 0 on the rim to 3 in the middle.
 #[inline]
-fn center_manhattan(sq: Square) -> i32 {
-    CENTER_DIST[file_of(sq) as usize] + CENTER_DIST[rank_of(sq) as usize]
+fn edge_distance(x: u8) -> i32 {
+    let x = x as i32;
+    x.min(7 - x)
 }
 
-/// Number of non-king, non-pawn pieces.
+/// Drives the bare king to an edge: 90 on the rim, down to 28 in the centre.
 #[inline]
-fn officers(pos: &Position, c: Color) -> i32 {
-    popcount(pos.pieces_c(c) & !pos.pieces_pp(PieceType::Pawn, PieceType::King))
+fn push_to_edge(sq: Square) -> i32 {
+    let rd = edge_distance(rank_of(sq));
+    let fd = edge_distance(file_of(sq));
+    90 - (7 * fd * fd / 2 + 7 * rd * rd / 2)
 }
 
-/// Returns the mop-up term from the side to move's perspective and whether it is
-/// active (the caller caps fifty-move damping while it is).
-pub fn mop_up_term(pos: &Position) -> (Value, bool) {
+/// Brings the kings together: 120 when adjacent, falling to 0 across the board. The mate
+/// needs our king as much as the piece, so this is weighted like the edge term, not below it.
+#[inline]
+fn push_close(a: Square, b: Square) -> i32 {
+    140 - 20 * distance(a, b) as i32
+}
+
+/// Distance from the a1/h8 corners: 0 along the a8-h1 diagonal, 7 at a1 and h8.
+#[inline]
+fn push_to_corner(sq: Square) -> i32 {
+    (7 - rank_of(sq) as i32 - file_of(sq) as i32).abs()
+}
+
+/// Mirrors a square left to right, turning a dark-corner gradient into a light-corner one.
+#[inline]
+fn flip_file(sq: Square) -> Square {
+    sq ^ 7
+}
+
+/// A complete evaluation for KX vs K from the side to move's point of view, or `None` when
+/// the position is not one and the network should speak instead.
+pub fn kx_vs_k(pos: &Position) -> Option<Value> {
     for winner in [Color::White, Color::Black] {
         let loser = winner.flip();
-        let w_off = officers(pos, winner);
-        let l_off = officers(pos, loser);
-        let w_pawns = popcount(pos.pieces_cp(winner, PieceType::Pawn));
-        let l_pawns = popcount(pos.pieces_cp(loser, PieceType::Pawn));
 
-        // Loser: king plus at most one officer; winner: at least one officer; one side pawnless.
-        if l_off > 1 || w_off < 1 || (w_pawns > 0 && l_pawns > 0) {
+        // The defender must be a bare king, and the winner must be able to force mate with
+        // pieces alone. With a pawn anywhere the win runs through promotion, which the
+        // network handles and which is not always a win at all.
+        if pos.pieces_c(loser) != pos.pieces_cp(loser, PieceType::King) {
             continue;
         }
-        let lead = pos.non_pawn_material(winner) - pos.non_pawn_material(loser) + 100 * (w_pawns - l_pawns);
-        if lead < MIN_LEAD {
+        if pos.pieces_cp(winner, PieceType::Pawn) != 0 {
             continue;
         }
-        if crate::eval::side_cannot_mate(pos, winner) && w_pawns == 0 {
+        if crate::eval::side_cannot_mate(pos, winner) {
             continue;
         }
-        let bare = l_off == 0 && l_pawns == 0;
-        let scale = if bare { 100 } else { 50 };
 
-        let our_king = pos.king_square(winner);
-        let their_king = pos.king_square(loser);
-
-        // Push the bare king to the rim and bring our king toward it. The weights must
-        // beat the loser's centralising king PST (~80cp centre-to-corner) by a margin.
-        let mut bonus = 35 * center_manhattan(their_king);
-        bonus += 10 * (14 - manhattan_distance(our_king, their_king) as i32);
-
-        // K+B+N vs K: mate is only possible in a corner of the bishop's colour.
+        let wk = pos.king_square(winner);
+        let lk = pos.king_square(loser);
         let bishops = pos.pieces_cp(winner, PieceType::Bishop);
         let knights = pos.pieces_cp(winner, PieceType::Knight);
-        if bare && w_off == 2 && popcount(bishops) == 1 && popcount(knights) == 1 {
-            let light = bishops & LIGHT_SQUARES != 0;
-            let (c1, c2) = if light { (squares::A8, squares::H1) } else { (squares::A1, squares::H8) };
-            let d = distance(their_king, c1).min(distance(their_king, c2)) as i32;
-            bonus += 20 * (7 - d);
-        }
 
-        let scaled = bonus * scale / 100;
-        let cap = if bare { BARE_CAP } else { DEFENDED_CAP };
-        let term = scaled.clamp(0, cap);
-        let stm_term = if pos.side_to_move() == winner { term } else { -term };
-        return (stm_term, true);
+        let shaping = if popcount(bishops) == 1 && popcount(knights) == 1 {
+            // K+B+N mates only in the two corners the bishop attacks, so distance to the
+            // nearer of those is the whole objective; the generic edge term is dropped
+            // because it pulls just as hard toward the two corners that cannot mate.
+            let dark_bishop = bishops & DARK_SQUARES != 0;
+            let target = if dark_bishop { lk } else { flip_file(lk) };
+            CORNER_WEIGHT * push_to_corner(target) + push_close(wk, lk)
+        } else {
+            push_to_edge(lk) + push_close(wk, lk)
+        };
+
+        let v = KNOWN_WIN + pos.non_pawn_material(winner) + shaping;
+        return Some(if pos.side_to_move() == winner { v } else { -v });
     }
-    (0, false)
+    None
 }
