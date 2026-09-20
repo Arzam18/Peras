@@ -1,0 +1,84 @@
+Name: Release Android Binary
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and upload to (e.g. v3.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NET_URL: https://github.com/FirePlank/Peras-networks/releases/download/peras-v4/peras-v4.nnue
+  TARGET: aarch64-linux-android
+  CPU: armv8-a
+
+jobs:
+  build-android:
+    name: android-arm64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Configure Android NDK Linker
+        shell: bash
+        run: |
+          CLANG_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG_BIN" >> $GITHUB_ENV
+          echo "CC_aarch64_linux_android=$CLANG_BIN" >> $GITHUB_ENV
+
+      - name: Fetch the network
+        shell: bash
+        run: |
+          mkdir -p nets
+          curl -sSfL "$NET_URL" -o nets/peras.nnue
+          ls -l nets/peras.nnue
+
+      - name: Build
+        shell: bash
+        run: RUSTFLAGS="-C target-cpu=${{ env.CPU }}" cargo build --release --target ${{ env.TARGET }}
+
+      - name: Package
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          DIR="peras-${TAG#v}-android-arm64"
+          mkdir -p "$DIR"
+          BIN=target/${{ env.TARGET }}/release/peras
+          
+          cp "$BIN" "$DIR/peras"
+          [ -f README.md ] && cp README.md "$DIR/"
+          [ -f CHANGELOG.md ] && cp CHANGELOG.md "$DIR/"
+          [ -f LICENSE ] && cp LICENSE "$DIR/"
+          
+          tar czf "$DIR.tar.gz" "$DIR"
+          echo "ASSET=$DIR.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload to Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            cat > notes.md <<'NOTES'
+          ## Android Release
+
+          Self-contained Android binary (`aarch64-linux-android`). Suitable for Termux or Android Chess GUIs (e.g., DroidFish).
+          NOTES
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md || true
+          fi
+          gh release upload "$TAG" "$ASSET" --clobber
