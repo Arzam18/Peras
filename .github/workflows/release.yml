@@ -54,6 +54,15 @@ jobs:
             os: macos-latest
             target: x86_64-apple-darwin
             cpu: x86-64-v3
+          # Statically linked against musl, so it also runs on Android, whose libc is not
+          # glibc. Built on an arm64 runner so the tests and bench run natively. rust-lld
+          # links it without a musl C toolchain, which the engine can do because it has no
+          # C dependencies.
+          - name: linux-aarch64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            cpu: generic
+            rustflags: -C linker=rust-lld
 
     steps:
       - uses: actions/checkout@v4
@@ -75,12 +84,12 @@ jobs:
       - name: Build
         shell: bash
         # RUSTFLAGS overrides the target-cpu in .cargo/config.toml, which is x86-only.
-        run: RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}" cargo build --release --target ${{ matrix.target }}
+        run: RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} ${{ matrix.rustflags }}" cargo build --release --target ${{ matrix.target }}
 
       - name: Test and bench
         shell: bash
         run: |
-          RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}" cargo test --release --target ${{ matrix.target }}
+          RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} ${{ matrix.rustflags }}" cargo test --release --target ${{ matrix.target }}
           BIN=target/${{ matrix.target }}/release/peras
           [ -f "$BIN.exe" ] && BIN="$BIN.exe"
           "$BIN" bench 12
@@ -124,6 +133,7 @@ jobs:
           | `windows-x86-64`, `linux-x86-64` | Any x86-64 with SSE4.2. About a quarter slower |
           | `macos-arm64` | Apple Silicon |
           | `macos-x86-64-avx2` | Intel Macs |
+          | `linux-aarch64-musl` | arm64 Linux, and Android via a terminal app. Static, so it needs nothing installed |
           NOTES
             gh release create "$TAG" --title "$TAG" --notes-file notes.md || true
           fi
