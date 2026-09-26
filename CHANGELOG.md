@@ -44,6 +44,10 @@ KBN vs K          1/12     9/12
 total            41/72    69/72
 ```
 
+### Added
+- An `arm64` Linux build, statically linked against musl so it needs nothing installed and
+  also runs on Android through a terminal app
+
 ### Changed
 - KX vs K now has its own evaluation rather than a bonus added to the network's. The network
   reads the material, saturates, and offers nothing further to steer by, so the guidance was
