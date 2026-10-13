@@ -19,7 +19,7 @@ use params::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub use timeman::{Limits, TimeManager};
-pub use tt::{TranspositionTable, value_from_tt, value_to_tt};
+pub use tt::{TTData, TranspositionTable, value_from_tt, value_to_tt};
 
 pub fn init() {
     crate::zobrist::init();
@@ -630,6 +630,24 @@ impl Searcher {
 
     // Iterative deepening
 
+    /// Exact TT score of depth >= 5 for the root or its only child, whichever is deeper.
+    fn forced_move_tt_score(&self, pos: &mut Position) -> Option<Value> {
+        let rule50 = pos.rule50_count();
+        let exact = |d: TTData, ply: usize, rule50: i32| {
+            (d.bound == Bound::Exact && d.depth >= 5 && d.score != VALUE_NONE)
+                .then(|| (d.depth, value_from_tt(d.score, ply, rule50)))
+        };
+        let root = self.tt.probe(pos.key()).and_then(|d| exact(d, 0, rule50));
+        let m = self.root_moves[0].mv;
+        pos.make_move(m, pos.gives_check(m));
+        let child = self.tt.probe(pos.key()).and_then(|d| exact(d, 1, pos.rule50_count())).map(|(d, s)| (d, -s));
+        pos.unmake_move(m);
+        match (root, child) {
+            (Some(r), Some(c)) => Some(if c.0 >= r.0 { c.1 } else { r.1 }),
+            (r, c) => r.or(c).map(|(_, s)| s),
+        }
+    }
+
     /// Runs the whole search for this thread. Results are left in `root_moves`,
     /// `best_move_root`, `prev_score` and `completed_depth`.
     pub fn iterative_deepening(&mut self, pos: &mut Position) {
@@ -658,18 +676,19 @@ impl Searcher {
         let want = if self.skill_level < 20 { self.multipv.max(4) } else { self.multipv };
         let multipv = want.clamp(1, self.root_moves.len());
 
-        // A forced move under a clock needs no deliberation.
+        // A forced move under a clock takes a deep exact TT score when the previous search
+        // left one, and otherwise searches on a fraction of the budget for an honest score.
         if self.root_moves.len() == 1 && self.thread_id == 0 && self.tm.timed && !self.limits.infinite && self.limits.depth == 0 {
-            let m = self.root_moves[0].mv;
-            let raw = evaluate(pos);
-            let score = self.adjusted_eval(pos, raw, 0);
-            self.root_moves[0].score = score;
-            self.prev_score = score;
-            self.completed_depth = 1;
-            self.print_info(pos, 1);
-            self.stop.store(true, Ordering::Relaxed);
-            let _ = m;
-            return;
+            if let Some(score) = self.forced_move_tt_score(pos) {
+                self.root_moves[0].score = score;
+                self.prev_score = score;
+                self.completed_depth = 1;
+                self.print_info(pos, 1);
+                self.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+            self.tm.maximum = (self.tm.optimum / 4).min(self.tm.maximum);
+            self.tm.optimum = (self.tm.optimum / 8).min(self.tm.maximum);
         }
 
         // Helpers with odd ids run one depth ahead so the threads diverge.
