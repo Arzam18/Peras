@@ -18,6 +18,26 @@ Version bumps are decided by what changed rather than by an accumulator:
 
 The bold Elo line under each release comes from a directly measured head-to-head match against the previous release at 10s+0.1s on one thread. Where that match is too one-sided for the rating formula to resolve, the figure is taken instead from each release's own position on a ladder of Stockfish's rating-limited modes, which is noted when it happens.
 
+## v3.6.1 (2026-10-13)
+[compare to v3.6.0](https://github.com/FirePlank/Peras/compare/v3.6.0...v3.6.1)
+
+**Elo-neutral, and not a regression.** A forced move reports a searched score rather than
+a static evaluation.
+
+```
+Score of v3.6.1 vs v3.6.0: 868 - 813 - 2402  [0.507] 4083
+Elo: +4.7 +/- 6.8  (LOS 91.0%), 0 time losses
+SPRT bounds elo0=-5 elo1=0, alpha=beta=0.05, 10s+0.1s, one thread
+```
+
+### Fixed
+- With one legal move under a clock, the engine played it at once and reported the static
+  evaluation. Forced moves mostly come in the middle of a tactic, such as out of check,
+  where that number means little, and it is the score the GUI shows. It now takes an exact
+  score of depth 5 or more that the previous search left in the transposition table, for
+  the position or the one after the move; failing that, it searches on an eighth of its
+  usual time target, stopping by a quarter
+
 ## v3.6.0 (2026-09-21)
 [compare to v3.5.0](https://github.com/FirePlank/Peras/compare/v3.5.0...v3.6.0)
 
